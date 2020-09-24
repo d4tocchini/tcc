@@ -27,6 +27,7 @@
  && !defined(__FreeBSD_kernel__) \
  && !defined(__DragonFly__) \
  && !defined(__OpenBSD__) \
+ && !defined(__APPLE__) \
  && !defined(__NetBSD__)
 #include <malloc.h>
 #endif
@@ -68,27 +69,38 @@
 #define EXIT_SEM()
 #define WAIT_SEM()
 #define POST_SEM()
+#define TRY_SEM()
 #define HAVE_MEMALIGN          (0)
-#define HAS_ENVIRON            (0)
 #define MALLOC_REDIR           (0)
 #define HAVE_PTHREAD_CREATE    (0)
 #define HAVE_CTYPE             (0)
 #define HAVE_ERRNO             (0)
+#define HAVE_SIGNAL            (0)
+#define HAVE_SIGACTION         (0)
+#define HAVE_FORK              (0)
+#define HAVE_TLS_FUNC          (0)
+#define HAVE_TLS_VAR           (0)
 
 #elif defined(_WIN32)
 
 #include <windows.h>
+#include <signal.h>
 static CRITICAL_SECTION bounds_sem;
 #define INIT_SEM()             InitializeCriticalSection(&bounds_sem)
 #define EXIT_SEM()             DeleteCriticalSection(&bounds_sem)
 #define WAIT_SEM()             EnterCriticalSection(&bounds_sem)
 #define POST_SEM()             LeaveCriticalSection(&bounds_sem)
+#define TRY_SEM()              TryEnterCriticalSection(&bounds_sem)
 #define HAVE_MEMALIGN          (0)
-#define HAS_ENVIRON            (0)
 #define MALLOC_REDIR           (0)
 #define HAVE_PTHREAD_CREATE    (0)
 #define HAVE_CTYPE             (0)
 #define HAVE_ERRNO             (0)
+#define HAVE_SIGNAL            (1)
+#define HAVE_SIGACTION         (0)
+#define HAVE_FORK              (0)
+#define HAVE_TLS_FUNC          (1)
+#define HAVE_TLS_VAR           (0)
 
 #else
 
@@ -98,7 +110,16 @@ static CRITICAL_SECTION bounds_sem;
 #include <pthread.h>
 #include <dlfcn.h>
 #include <errno.h>
-#if 0
+#include <signal.h>
+#ifdef __APPLE__
+#include <dispatch/dispatch.h>
+static dispatch_semaphore_t bounds_sem;
+#define INIT_SEM()             bounds_sem = dispatch_semaphore_create(1)
+#define EXIT_SEM()             dispatch_release(*(dispatch_object_t*)&bounds_sem)
+#define WAIT_SEM()             if (use_sem) dispatch_semaphore_wait(bounds_sem, DISPATCH_TIME_FOREVER)
+#define POST_SEM()             if (use_sem) dispatch_semaphore_signal(bounds_sem)
+#define TRY_SEM()              if (use_sem) dispatch_semaphore_wait(bounds_sem, DISPATCH_TIME_NOW)
+#elif 0
 #include <semaphore.h>
 static sem_t bounds_sem;
 #define INIT_SEM()             sem_init (&bounds_sem, 0, 1)
@@ -106,6 +127,15 @@ static sem_t bounds_sem;
 #define WAIT_SEM()             if (use_sem) while (sem_wait (&bounds_sem) < 0 \
                                                    && errno == EINTR)
 #define POST_SEM()             if (use_sem) sem_post (&bounds_sem)
+#define TRY_SEM()              if (use_sem) while (sem_trywait (&bounds_sem) < 0 \
+                                                   && errno == EINTR)
+#elif 0
+static pthread_mutex_t bounds_mtx;
+#define INIT_SEM()             pthread_mutex_init (&bounds_mtx, NULL)
+#define EXIT_SEM()             pthread_mutex_destroy (&bounds_mtx)
+#define WAIT_SEM()             if (use_sem) pthread_mutex_lock (&bounds_mtx)
+#define POST_SEM()             if (use_sem) pthread_mutex_unlock (&bounds_mtx)
+#define TRY_SEM()              if (use_sem) pthread_mutex_trylock (&bounds_mtx)
 #else
 static pthread_spinlock_t bounds_spin;
 /* about 25% faster then semaphore. */
@@ -113,26 +143,51 @@ static pthread_spinlock_t bounds_spin;
 #define EXIT_SEM()             pthread_spin_destroy (&bounds_spin)
 #define WAIT_SEM()             if (use_sem) pthread_spin_lock (&bounds_spin)
 #define POST_SEM()             if (use_sem) pthread_spin_unlock (&bounds_spin)
+#define TRY_SEM()              if (use_sem) pthread_spin_trylock (&bounds_spin)
 #endif
 #define HAVE_MEMALIGN          (1)
-#define HAS_ENVIRON            (1)
 #define MALLOC_REDIR           (1)
 #define HAVE_PTHREAD_CREATE    (1)
 #define HAVE_CTYPE             (1)
 #define HAVE_ERRNO             (1)
+#define HAVE_SIGNAL            (1)
+#define HAVE_SIGACTION         (1)
+#define HAVE_FORK              (1)
+#if !defined(__APPLE__) && defined(__GNUC__) && (defined(__i386__) || defined(__x86_64__))
+#define HAVE_TLS_FUNC          (0)
+#define HAVE_TLS_VAR           (1)
+#else
+#define HAVE_TLS_FUNC          (1)
+#define HAVE_TLS_VAR           (0)
+#endif
+#endif
 
+#if MALLOC_REDIR
 static void *(*malloc_redir) (size_t);
 static void *(*calloc_redir) (size_t, size_t);
 static void (*free_redir) (void *);
 static void *(*realloc_redir) (void *, size_t);
+static unsigned int pool_index;
+static unsigned char __attribute__((aligned(16))) initial_pool[256];
+#endif
+#if HAVE_MEMALIGN
 static void *(*memalign_redir) (size_t, size_t);
+#endif
+#if HAVE_PTHREAD_CREATE
 static int (*pthread_create_redir) (pthread_t *thread,
                                     const pthread_attr_t *attr,
                                     void *(*start_routine)(void *), void *arg);
-static unsigned int pool_index;
-static unsigned char __attribute__((aligned(16))) initial_pool[256];
-static unsigned char use_sem;
-
+#endif
+#if HAVE_SIGNAL
+typedef void (*bound_sig)(int);
+static bound_sig (*signal_redir) (int signum, bound_sig handler);
+#endif
+#if HAVE_SIGACTION
+static int (*sigaction_redir) (int signum, const struct sigaction *act,
+                               struct sigaction *oldact);
+#endif
+#if HAVE_FORK
+static int (*fork_redir) (void);
 #endif
 
 #define TCC_TYPE_NONE           (0)
@@ -163,7 +218,7 @@ typedef struct alloca_list_struct {
 #if defined(_WIN32)
 #define BOUND_TID_TYPE   DWORD
 #define BOUND_GET_TID    GetCurrentThreadId()
-#elif defined(__i386__) || defined(__x86_64__)
+#elif defined(__i386__) || defined(__x86_64__) || defined(__arm__) || defined(__aarch64__) || defined(__riscv)
 #define BOUND_TID_TYPE   pid_t
 #define BOUND_GET_TID    syscall (SYS_gettid)
 #else
@@ -187,7 +242,7 @@ static Tree * splay_delete(size_t addr, Tree *t);
 void splay_printtree(Tree * t, int d);
 
 /* external interface */
-void __bound_checking (int no_check);
+void __bounds_checking (int no_check);
 void __bound_never_fatal (int no_check);
 DLL_EXPORT void * __bound_ptr_add(void *p, size_t offset);
 DLL_EXPORT void * __bound_ptr_indir1(void *p, size_t offset);
@@ -198,8 +253,8 @@ DLL_EXPORT void * __bound_ptr_indir12(void *p, size_t offset);
 DLL_EXPORT void * __bound_ptr_indir16(void *p, size_t offset);
 DLL_EXPORT void FASTCALL __bound_local_new(void *p1);
 DLL_EXPORT void FASTCALL __bound_local_delete(void *p1);
-void __bound_init(size_t *);
-void __bound_main_arg(char **p);
+void __bound_init(size_t *, int);
+void __bound_main_arg(int argc, char **argv, char **envp);
 void __bound_exit(void);
 #if !defined(_WIN32)
 void *__bound_mmap (void *start, size_t size, int prot, int flags, int fd,
@@ -222,6 +277,19 @@ DLL_EXPORT int __bound_strncmp(const char *s1, const char *s2, size_t n);
 DLL_EXPORT char *__bound_strcat(char *dest, const char *src);
 DLL_EXPORT char *__bound_strchr(const char *string, int ch);
 DLL_EXPORT char *__bound_strdup(const char *s);
+
+#if defined(__arm__)
+DLL_EXPORT void *__bound___aeabi_memcpy(void *dst, const void *src, size_t size);
+DLL_EXPORT void *__bound___aeabi_memmove(void *dst, const void *src, size_t size);
+DLL_EXPORT void *__bound___aeabi_memmove4(void *dst, const void *src, size_t size);
+DLL_EXPORT void *__bound___aeabi_memmove8(void *dst, const void *src, size_t size);
+DLL_EXPORT void *__bound___aeabi_memset(void *dst, int c, size_t size);
+DLL_EXPORT void *__aeabi_memcpy(void *dst, const void *src, size_t size);
+DLL_EXPORT void *__aeabi_memmove(void *dst, const void *src, size_t size);
+DLL_EXPORT void *__aeabi_memmove4(void *dst, const void *src, size_t size);
+DLL_EXPORT void *__aeabi_memmove8(void *dst, const void *src, size_t size);
+DLL_EXPORT void *__aeabi_memset(void *dst, int c, size_t size);
+#endif
 
 #if MALLOC_REDIR
 #define BOUND_MALLOC(a)          malloc_redir(a)
@@ -260,8 +328,53 @@ static unsigned char print_calls;
 static unsigned char print_heap;
 static unsigned char print_statistic;
 static unsigned char no_strdup;
-static signed char never_fatal;
-static signed char no_checking = 1;
+static unsigned char use_sem;
+static int never_fatal;
+#if HAVE_TLS_FUNC
+#if defined(_WIN32)
+static int no_checking = 0;
+static DWORD no_checking_key;
+#define NO_CHECKING_CHECK() if (!p) {                                         \
+                                  p = (int *) LocalAlloc(LPTR, sizeof(int));  \
+                                  if (!p) bound_alloc_error("tls malloc");    \
+                                  *p = 0;                                     \
+                                  TlsSetValue(no_checking_key, p);            \
+                            }
+#define NO_CHECKING_GET()   ({ int *p = TlsGetValue(no_checking_key);         \
+                               NO_CHECKING_CHECK();                           \
+                               *p;                                            \
+                            })
+#define NO_CHECKING_SET(v)  { int *p = TlsGetValue(no_checking_key);          \
+                              NO_CHECKING_CHECK();                            \
+                              *p = v;                                         \
+                            }
+#else
+static int no_checking = 0;
+static pthread_key_t no_checking_key;
+#define NO_CHECKING_CHECK() if (!p) {                                         \
+                                  p = (int *) BOUND_MALLOC(sizeof(int));      \
+                                  if (!p) bound_alloc_error("tls malloc");    \
+                                  *p = 0;                                     \
+                                  pthread_setspecific(no_checking_key, p);    \
+                            }
+#define NO_CHECKING_GET()   ({ int *p = pthread_getspecific(no_checking_key); \
+                               NO_CHECKING_CHECK();                           \
+                               *p;                                            \
+                            })
+#define NO_CHECKING_SET(v)  { int *p = pthread_getspecific(no_checking_key);  \
+                              NO_CHECKING_CHECK();                            \
+                              *p = v;                                         \
+                            }
+#endif
+#elif HAVE_TLS_VAR
+static __thread int no_checking = 0;
+#define NO_CHECKING_GET()  no_checking
+#define NO_CHECKING_SET(v) no_checking = v 
+#else
+static int no_checking = 0;
+#define NO_CHECKING_GET()  no_checking
+#define NO_CHECKING_SET(v) no_checking = v 
+#endif
 static char exec[100];
 
 #if BOUND_STATISTIC
@@ -311,32 +424,6 @@ static unsigned long long bound_splay_delete;
 #define INCR_COUNT_SPLAY(x)
 #endif
 
-/* currently only i386/x86_64 supported. Change for other platforms */
-static void fetch_and_add(signed char* variable, signed char value)
-{
-#if defined __i386__ || defined __x86_64__
-      __asm__ volatile("lock; addb %0, %1"
-        : "+r" (value), "+m" (*variable) // input+output
-        : // No input-only
-        : "memory"
-      );
-#else
-      *variable += value;
-#endif
-}
-
-/* enable/disable checking. This can be used in signal handlers. */
-void __bound_checking (int no_check)
-{
-    fetch_and_add (&no_checking, no_check);
-}
-
-/* enable/disable checking. This can be used in signal handlers. */
-void __bound_never_fatal (int neverfatal)
-{
-    fetch_and_add (&never_fatal, neverfatal);
-}
-
 int tcc_backtrace(const char *fmt, ...);
 
 /* print a bound error message */
@@ -362,13 +449,51 @@ static void bound_not_found_warning(const char *file, const char *function,
     dprintf(stderr, "%s%s, %s(): Not found %p\n", exec, file, function, ptr);
 }
 
+static void fetch_and_add(int* variable, int value)
+{
+#if defined __i386__ || defined __x86_64__
+      __asm__ volatile("lock; addl %0, %1"
+        : "+r" (value), "+m" (*variable) // input+output
+        : // No input-only
+        : "memory"
+      );
+#elif defined __arm__
+      extern void fetch_and_add_arm(int* variable, int value);
+      fetch_and_add_arm(variable, value);
+#elif defined __aarch64__
+      extern void fetch_and_add_arm64(int* variable, int value);
+      fetch_and_add_arm64(variable, value);
+#elif defined __riscv
+      extern void fetch_and_add_riscv64(int* variable, int value);
+      fetch_and_add_riscv64(variable, value);
+#else
+      *variable += value;
+#endif
+}
+
+/* enable/disable checking. This can be used in signal handlers. */
+void __bounds_checking (int no_check)
+{
+#if HAVE_TLS_FUNC || HAVE_TLS_VAR
+    NO_CHECKING_SET(NO_CHECKING_GET() + no_check);
+#else
+    fetch_and_add (&no_checking, no_check);
+#endif
+}
+
+/* enable/disable checking. This can be used in signal handlers. */
+void __bound_never_fatal (int neverfatal)
+{
+    fetch_and_add (&never_fatal, neverfatal);
+}
+
 /* return '(p + offset)' for pointer arithmetic (a pointer can reach
    the end of a region in this case */
 void * __bound_ptr_add(void *p, size_t offset)
 {
     size_t addr = (size_t)p;
 
-    if (no_checking)
+    if (NO_CHECKING_GET())
         return p + offset;
 
     dprintf(stderr, "%s, %s(): %p 0x%lx\n",
@@ -416,7 +541,7 @@ void * __bound_ptr_indir ## dsize (void *p, size_t offset)                     \
 {                                                                              \
     size_t addr = (size_t)p;                                                   \
                                                                                \
-    if (no_checking)                                                           \
+    if (NO_CHECKING_GET())                                                     \
         return p + offset;                                                     \
                                                                                \
     dprintf(stderr, "%s, %s(): %p 0x%lx\n",                                    \
@@ -482,7 +607,7 @@ void FASTCALL __bound_local_new(void *p1)
 {
     size_t addr, fp, *p = p1;
 
-    if (no_checking)
+    if (NO_CHECKING_GET())
          return;
     GET_CALLER_FP(fp);
     dprintf(stderr, "%s, %s(): p1=%p fp=%p\n",
@@ -512,7 +637,7 @@ void FASTCALL __bound_local_delete(void *p1)
 {
     size_t addr, fp, *p = p1;
 
-    if (no_checking)
+    if (NO_CHECKING_GET())
          return;
     GET_CALLER_FP(fp);
     dprintf(stderr, "%s, %s(): p1=%p fp=%p\n",
@@ -591,6 +716,9 @@ void __bound_new_region(void *p, size_t size)
     alloca_list_type *cur;
     alloca_list_type *new;
 
+    if (NO_CHECKING_GET())
+        return;
+
     dprintf(stderr, "%s, %s(): %p, 0x%lx\n",
             __FILE__, __FUNCTION__, p, (unsigned long)size);
     GET_CALLER_FP (fp);
@@ -611,8 +739,7 @@ void __bound_new_region(void *p, size_t size)
         last = cur;
         cur = cur->next;
     }
-    if (no_checking == 0)
-        tree = splay_insert((size_t)p, size, tree);
+    tree = splay_insert((size_t)p, size, tree);
     if (new) {
         new->fp = fp;
         new->p = p;
@@ -632,7 +759,7 @@ void __bound_setjmp(jmp_buf env)
     jmp_list_type *jl;
     void *e = (void *) env;
 
-    if (no_checking == 0) {
+    if (NO_CHECKING_GET() == 0) {
         dprintf(stderr, "%s, %s(): %p\n", __FILE__, __FUNCTION__, e);
         WAIT_SEM ();
         INCR_COUNT(bound_setjmp_count);
@@ -668,7 +795,7 @@ static void __bound_long_jump(jmp_buf env, int val, int sig, const char *func)
     void *e;
     BOUND_TID_TYPE tid;
 
-    if (no_checking == 0) {
+    if (NO_CHECKING_GET() == 0) {
         e = (void *)env;
         tid = BOUND_GET_TID;
         dprintf(stderr, "%s, %s(): %p\n", __FILE__, func, e);
@@ -758,15 +885,27 @@ void __bound_siglongjmp(jmp_buf env, int val)
 #pragma GCC diagnostic pop
 #endif
 
-void __bound_init(size_t *p)
+void __bound_init(size_t *p, int mode)
 {
-    dprintf(stderr, "%s, %s(): start\n", __FILE__, __FUNCTION__);
+    dprintf(stderr, "%s, %s(): start %s\n", __FILE__, __FUNCTION__,
+            mode < 0 ? "lazy" : mode == 0 ? "normal use" : "for -run");
 
     if (inited) {
         WAIT_SEM();
         goto add_bounds;
     }
     inited = 1;
+
+#if HAVE_TLS_FUNC
+#if defined(_WIN32)
+    no_checking_key = TlsAlloc();
+    TlsSetValue(no_checking_key, &no_checking);
+#else
+    pthread_key_create(&no_checking_key, NULL);
+    pthread_setspecific(no_checking_key, &no_checking);
+#endif
+#endif
+    NO_CHECKING_SET(1);
 
     print_warn_ptr_add = getenv ("TCC_BOUNDS_WARN_POINTER_ADD") != NULL;
     print_calls = getenv ("TCC_BOUNDS_PRINT_CALLS") != NULL;
@@ -778,9 +917,12 @@ void __bound_init(size_t *p)
 
 #if MALLOC_REDIR
     {
-        void *addr = RTLD_NEXT;
+        void *addr = mode > 0 ? RTLD_DEFAULT : RTLD_NEXT;
 
-        /* tcc -run required RTLD_DEFAULT. Normal usage requires RTLD_NEXT */
+        /* tcc -run required RTLD_DEFAULT. Normal usage requires RTLD_NEXT,
+           but using RTLD_NEXT with -run segfaults on MacOS in dyld as the
+           generated code segment isn't registered with dyld and hence the
+           caller image of dlsym isn't known to it */
         *(void **) (&malloc_redir) = dlsym (addr, "malloc");
         if (malloc_redir == NULL) {
             dprintf(stderr, "%s, %s(): use RTLD_DEFAULT\n",
@@ -806,6 +948,29 @@ void __bound_init(size_t *p)
         *(void **) (&pthread_create_redir) = dlsym (addr, "pthread_create");
         dprintf(stderr, "%s, %s(): pthread_create_redir %p\n",
                 __FILE__, __FUNCTION__, pthread_create_redir);
+        if (pthread_create_redir == NULL)
+            bound_alloc_error ("Cannot redirect pthread_create");
+#endif
+#if HAVE_SIGNAL
+        *(void **) (&signal_redir) = dlsym (addr, "signal");
+        dprintf(stderr, "%s, %s(): signal_redir %p\n",
+                __FILE__, __FUNCTION__, signal_redir);
+        if (signal_redir == NULL)
+            bound_alloc_error ("Cannot redirect signal");
+#endif
+#if HAVE_SIGACTION
+        *(void **) (&sigaction_redir) = dlsym (addr, "sigaction");
+        dprintf(stderr, "%s, %s(): sigaction_redir %p\n",
+                __FILE__, __FUNCTION__, sigaction_redir);
+        if (sigaction_redir == NULL)
+            bound_alloc_error ("Cannot redirect sigaction");
+#endif
+#if HAVE_FORK
+        *(void **) (&fork_redir) = dlsym (addr, "fork");
+        dprintf(stderr, "%s, %s(): fork_redir %p\n",
+                __FILE__, __FUNCTION__, fork_redir);
+        if (fork_redir == NULL)
+            bound_alloc_error ("Cannot redirect fork");
 #endif
     }
 #endif
@@ -814,10 +979,10 @@ void __bound_init(size_t *p)
     {
         FILE *fp;
         unsigned char found;
-        unsigned long long start;
-        unsigned long long end;
-        unsigned long long ad =
-            (unsigned long long) __builtin_return_address(0);
+        unsigned long start;
+        unsigned long end;
+        unsigned long ad =
+            (unsigned long) __builtin_return_address(0);
         char line[1000];
 
         /* Display exec name. Usefull when a lot of code is compiled with tcc */
@@ -835,7 +1000,7 @@ void __bound_init(size_t *p)
         fp = fopen ("/proc/self/maps", "r");
         if (fp) {
             while (fgets (line, sizeof(line), fp)) {
-                if (sscanf (line, "%Lx-%Lx", &start, &end) == 2 &&
+                if (sscanf (line, "%lx-%lx", &start, &end) == 2 &&
                             ad >= start && ad < end) {
                     found = 1;
                     break;
@@ -855,6 +1020,10 @@ void __bound_init(size_t *p)
     WAIT_SEM ();
 
 #if HAVE_CTYPE
+#ifdef __APPLE__
+    tree = splay_insert((size_t) &_DefaultRuneLocale,
+                        sizeof (_DefaultRuneLocale), tree);
+#else
     /* XXX: Does not work if locale is changed */
     tree = splay_insert((size_t) __ctype_b_loc(),
                         sizeof (unsigned short *), tree);
@@ -868,6 +1037,7 @@ void __bound_init(size_t *p)
                         sizeof (__int32_t *), tree);
     tree = splay_insert((size_t) (*__ctype_toupper_loc() - 128),
                         384 * sizeof (__int32_t), tree);
+#endif
 #endif
 #if HAVE_ERRNO
     tree = splay_insert((size_t) (&errno), sizeof (int), tree);
@@ -892,65 +1062,63 @@ add_bounds:
 no_bounds:
 
     POST_SEM ();
-    no_checking = 0;
+    NO_CHECKING_SET(0);
     dprintf(stderr, "%s, %s(): end\n\n", __FILE__, __FUNCTION__);
 }
 
-void __bound_main_arg(char **p)
-{
-    char *start = (char *) p;
-
-    WAIT_SEM ();
-    while (*p) {
-        tree = splay_insert((size_t) *p, strlen (*p) + 1, tree);
-        ++p;
-    }
-    tree = splay_insert((size_t) start, (char *) p - start, tree);
-    POST_SEM ();
-#if BOUND_DEBUG
-    if (print_calls) {
-        p = (char **) start;
-        while (*p) {
-            dprintf(stderr, "%s, %s(): %p 0x%lx\n",
-                    __FILE__, __FUNCTION__,
-                    *p, (unsigned long)(strlen (*p) + 1));
-            ++p;
-        }
-        dprintf(stderr, "%s, %s(): argv %p 0x%lx\n",
-                __FILE__, __FUNCTION__,
-                start, (unsigned long)((char *) p - start));
-    }
+void
+#if (defined(__GLIBC__) && (__GLIBC_MINOR__ >= 4)) || defined(_WIN32)
+__attribute__((constructor))
 #endif
-
-#if HAS_ENVIRON
-    {
-        extern char **environ;
+__bound_main_arg(int argc, char **argv, char **envp)
+{
+    __bound_init (0, -1);
+    if (argc && argv) {
+        int i;
 
         WAIT_SEM ();
-        p = environ;
-        start = (char *) p;
+        for (i = 0; i < argc; i++)
+            tree = splay_insert((size_t) argv[i], strlen (argv[i]) + 1, tree);
+        tree = splay_insert((size_t) argv, (argc + 1) * sizeof(char *), tree);
+        POST_SEM ();
+#if BOUND_DEBUG
+        if (print_calls) {
+            for (i = 0; i < argc; i++)
+                dprintf(stderr, "%s, %s(): arg %p 0x%lx\n",
+                        __FILE__, __FUNCTION__,
+                        argv[i], (unsigned long)(strlen (argv[i]) + 1));
+            dprintf(stderr, "%s, %s(): argv %p %d\n",
+                    __FILE__, __FUNCTION__, argv,
+                    (int)((argc + 1) * sizeof(char *)));
+        }
+#endif
+    }
+
+    if (envp && *envp) {
+        char **p = envp;
+
+        WAIT_SEM ();
         while (*p) {
             tree = splay_insert((size_t) *p, strlen (*p) + 1, tree);
             ++p;
         }
-        tree = splay_insert((size_t) start, (char *) p - start, tree);
+        tree = splay_insert((size_t) envp, (++p - envp) * sizeof(char *), tree);
         POST_SEM ();
 #if BOUND_DEBUG
         if (print_calls) {
-            p = environ;
+            p = envp;
             while (*p) {
-                dprintf(stderr, "%s, %s(): %p 0x%lx\n",
+                dprintf(stderr, "%s, %s(): env %p 0x%lx\n",
                         __FILE__, __FUNCTION__,
                         *p, (unsigned long)(strlen (*p) + 1));
                 ++p;
             }
-            dprintf(stderr, "%s, %s(): environ %p 0x%lx\n",
-                    __FILE__, __FUNCTION__,
-                    start, (unsigned long)((char *) p - start));
+            dprintf(stderr, "%s, %s(): environ %p %d\n",
+                    __FILE__, __FUNCTION__, envp,
+                    (int)((++p - envp) * sizeof(char *)));
         }
 #endif
     }
-#endif
 }
 
 void __attribute__((destructor)) __bound_exit(void)
@@ -963,16 +1131,16 @@ void __attribute__((destructor)) __bound_exit(void)
     dprintf(stderr, "%s, %s():\n", __FILE__, __FUNCTION__);
 
     if (inited) {
-#if !defined(_WIN32)
+#if !defined(_WIN32) && !defined(__APPLE__)
         if (print_heap) {
             extern void __libc_freeres (void);
             __libc_freeres ();
         }
 #endif
 
-        no_checking = 1;
+        NO_CHECKING_SET(1);
 
-        WAIT_SEM ();
+        TRY_SEM ();
         while (alloca_list) {
             alloca_list_type *next = alloca_list->next;
 
@@ -1008,6 +1176,13 @@ void __attribute__((destructor)) __bound_exit(void)
 #endif
         POST_SEM ();
         EXIT_SEM ();
+#if HAVE_TLS_FUNC
+#if defined(_WIN32)
+        TlsFree(no_checking_key);
+#else
+        pthread_key_delete(no_checking_key);
+#endif
+#endif
         inited = 0;
         if (print_statistic) {
 #if BOUND_STATISTIC
@@ -1055,12 +1230,157 @@ void __attribute__((destructor)) __bound_exit(void)
 }
 
 #if HAVE_PTHREAD_CREATE
+#if HAVE_TLS_FUNC
+typedef struct {
+    void *(*start_routine) (void *);
+    void *arg;
+} bound_thread_create_type;
+
+static void *bound_thread_create(void *bdata)
+{
+    bound_thread_create_type *data = (bound_thread_create_type *) bdata;
+    void *retval;
+    int *p = (int *) BOUND_MALLOC(sizeof(int));
+  
+    if (!p) bound_alloc_error("bound_thread_create malloc");
+    *p = 0;
+    pthread_setspecific(no_checking_key, p);
+    retval = data->start_routine(data->arg);
+    pthread_setspecific(no_checking_key, NULL);
+    BOUND_FREE (p);
+    BOUND_FREE (data);
+    return retval;
+}
+#endif
+
 int pthread_create(pthread_t *thread, const pthread_attr_t *attr,
                    void *(*start_routine) (void *), void *arg)
 {
     use_sem = 1;
     dprintf (stderr, "%s, %s()\n", __FILE__, __FUNCTION__);
+#if HAVE_TLS_FUNC
+    {
+        bound_thread_create_type *data;
+
+        data = (bound_thread_create_type *) BOUND_MALLOC(sizeof(bound_thread_create_type));
+        data->start_routine = start_routine;
+        data->arg = arg;
+        return pthread_create_redir(thread, attr, bound_thread_create, data);
+    }
+#else
     return pthread_create_redir(thread, attr, start_routine, arg);
+#endif
+}
+#endif
+
+#if HAVE_SIGNAL || HAVE_SIGACTION
+typedef union {
+#if HAVE_SIGNAL
+    bound_sig signal_handler;
+#endif
+#if HAVE_SIGACTION
+    void (*sig_handler)(int);
+    void (*sig_sigaction)(int, siginfo_t *, void *);
+#endif
+} bound_sig_type;
+
+static unsigned char bound_sig_used[NSIG];
+static bound_sig_type bound_sig_data[NSIG];
+#endif
+
+#if HAVE_SIGNAL
+static void signal_handler(int sig)
+{
+   __bounds_checking(1);
+   bound_sig_data[sig].signal_handler(sig);
+   __bounds_checking(-1);
+}
+
+bound_sig signal(int signum, bound_sig handler)
+{
+    bound_sig retval;
+
+    dprintf (stderr, "%s, %s() %d %p\n", __FILE__, __FUNCTION__,
+             signum, handler);
+    retval = signal_redir(signum, handler ? signal_handler : handler);
+    if (retval != SIG_ERR) {
+        if (bound_sig_used[signum])
+            retval = bound_sig_data[signum].signal_handler;
+        if (handler) {
+            bound_sig_used[signum] = 1;
+            bound_sig_data[signum].signal_handler = handler;
+        }
+    }
+    return retval;
+}
+#endif
+
+#if HAVE_SIGACTION
+static void sig_handler(int sig)
+{
+   __bounds_checking(1);
+   bound_sig_data[sig].sig_handler(sig);
+   __bounds_checking(-1);
+}
+
+static void sig_sigaction(int sig, siginfo_t *info, void *ucontext)
+{
+   __bounds_checking(1);
+   bound_sig_data[sig].sig_sigaction(sig, info, ucontext);
+   __bounds_checking(-1);
+}
+
+int sigaction(int signum, const struct sigaction *act, struct sigaction *oldact)
+{
+    int retval;
+    struct sigaction nact, oact;
+
+    dprintf (stderr, "%s, %s() %d %p %p\n", __FILE__, __FUNCTION__,
+             signum, act, oldact);
+    if (act) {
+        nact = *act;
+        if (nact.sa_flags & SA_SIGINFO)
+            nact.sa_sigaction = sig_sigaction;
+        else
+            nact.sa_handler = sig_handler;
+        retval = sigaction_redir(signum, &nact, &oact);
+    }
+    else
+        retval = sigaction_redir(signum, act, &oact);
+    if (retval >= 0) {
+        if (bound_sig_used[signum]) {
+            if (oact.sa_flags & SA_SIGINFO)
+                oact.sa_sigaction = bound_sig_data[signum].sig_sigaction;
+            else
+                oact.sa_handler = bound_sig_data[signum].sig_handler;
+        }
+        if (oldact) {
+            *oldact = oact;
+        }
+        if (act) {
+            bound_sig_used[signum] = 1;
+            if (act->sa_flags & SA_SIGINFO)
+                bound_sig_data[signum].sig_sigaction = act->sa_sigaction;
+            else
+                bound_sig_data[signum].sig_handler = act->sa_handler;
+        }
+    }
+    return retval;
+}
+#endif
+
+#if HAVE_FORK
+pid_t fork(void)
+{
+    pid_t retval;
+
+    WAIT_SEM();
+    retval = (*fork_redir)();
+    if (retval == 0)
+        INIT_SEM();
+    else
+        POST_SEM();
+    return retval;
 }
 #endif
 
@@ -1075,7 +1395,7 @@ void *__bound_malloc(size_t size, const void *caller)
 #if MALLOC_REDIR
     /* This will catch the first dlsym call from __bound_init */
     if (malloc_redir == NULL) {
-        __bound_init (0);
+        __bound_init (0, -1);
         if (malloc_redir == NULL) {
             ptr = &initial_pool[pool_index];
             pool_index = (pool_index + size + 15) & ~15;
@@ -1094,12 +1414,12 @@ void *__bound_malloc(size_t size, const void *caller)
     dprintf(stderr, "%s, %s(): %p, 0x%lx\n",
             __FILE__, __FUNCTION__, ptr, (unsigned long)size);
     
-    if (no_checking == 0) {
+    if (NO_CHECKING_GET() == 0) {
         WAIT_SEM ();
         INCR_COUNT(bound_malloc_count);
 
         if (ptr) {
-            tree = splay_insert ((size_t) ptr, size, tree);
+            tree = splay_insert ((size_t) ptr, size ? size : size + 1, tree);
             if (tree && tree->start == (size_t) ptr)
                 tree->type = TCC_TYPE_MALLOC;
         }
@@ -1133,12 +1453,12 @@ void *__bound_memalign(size_t size, size_t align, const void *caller)
     dprintf(stderr, "%s, %s(): %p, 0x%lx\n",
             __FILE__, __FUNCTION__, ptr, (unsigned long)size);
 
-    if (no_checking == 0) {
+    if (NO_CHECKING_GET() == 0) {
         WAIT_SEM ();
         INCR_COUNT(bound_memalign_count);
 
         if (ptr) {
-            tree = splay_insert((size_t) ptr, size, tree);
+            tree = splay_insert((size_t) ptr, size ? size : size + 1, tree);
             if (tree && tree->start == (size_t) ptr)
                 tree->type = TCC_TYPE_MEMALIGN;
         }
@@ -1156,7 +1476,7 @@ void __bound_free(void *ptr, const void *caller)
     size_t addr = (size_t) ptr;
     void *p;
 
-    if (ptr == NULL || tree == NULL || no_checking
+    if (ptr == NULL || tree == NULL
 #if MALLOC_REDIR
         || ((unsigned char *) ptr >= &initial_pool[0] &&
             (unsigned char *) ptr < &initial_pool[sizeof(initial_pool)])
@@ -1166,25 +1486,27 @@ void __bound_free(void *ptr, const void *caller)
 
     dprintf(stderr, "%s, %s(): %p\n", __FILE__, __FUNCTION__, ptr);
 
-    WAIT_SEM ();
-    INCR_COUNT(bound_free_count);
-    tree = splay (addr, tree);
-    if (tree->start == addr) {
-        if (tree->is_invalid) {
-            POST_SEM ();
-            bound_error("freeing invalid region");
-            return;
+    if (NO_CHECKING_GET() == 0) {
+        WAIT_SEM ();
+        INCR_COUNT(bound_free_count);
+        tree = splay (addr, tree);
+        if (tree->start == addr) {
+            if (tree->is_invalid) {
+                POST_SEM ();
+                bound_error("freeing invalid region");
+                return;
+            }
+            tree->is_invalid = 1;
+            memset (ptr, 0x5a, tree->size);
+            p = free_reuse_list[free_reuse_index];
+            free_reuse_list[free_reuse_index] = ptr;
+            free_reuse_index = (free_reuse_index + 1) % FREE_REUSE_SIZE;
+            if (p)
+                tree = splay_delete((size_t)p, tree);
+            ptr = p;
         }
-        tree->is_invalid = 1;
-        memset (ptr, 0x5a, tree->size);
-        p = free_reuse_list[free_reuse_index];
-        free_reuse_list[free_reuse_index] = ptr;
-        free_reuse_index = (free_reuse_index + 1) % FREE_REUSE_SIZE;
-        if (p)
-            tree = splay_delete((size_t)p, tree);
-        ptr = p;
+        POST_SEM ();
     }
-    POST_SEM ();
     BOUND_FREE (ptr);
 }
 
@@ -1205,18 +1527,18 @@ void *__bound_realloc(void *ptr, size_t size, const void *caller)
         return NULL;
     }
 
-    new_ptr = BOUND_REALLOC (ptr, size);
+    new_ptr = BOUND_REALLOC (ptr, size + 1);
     dprintf(stderr, "%s, %s(): %p, 0x%lx\n",
             __FILE__, __FUNCTION__, new_ptr, (unsigned long)size);
 
-    if (no_checking == 0) {
+    if (NO_CHECKING_GET() == 0) {
         WAIT_SEM ();
         INCR_COUNT(bound_realloc_count);
 
         if (ptr)
             tree = splay_delete ((size_t) ptr, tree);
         if (new_ptr) {
-            tree = splay_insert ((size_t) new_ptr, size, tree);
+            tree = splay_insert ((size_t) new_ptr, size ? size : size + 1, tree);
             if (tree && tree->start == (size_t) new_ptr)
                 tree->type = TCC_TYPE_REALLOC;
         }
@@ -1237,7 +1559,7 @@ void *__bound_calloc(size_t nmemb, size_t size)
 #if MALLOC_REDIR
     /* This will catch the first dlsym call from __bound_init */
     if (malloc_redir == NULL) {
-        __bound_init (0);
+        __bound_init (0, -1);
         if (malloc_redir == NULL) {
             ptr = &initial_pool[pool_index];
             pool_index = (pool_index + size + 15) & ~15;
@@ -1256,10 +1578,10 @@ void *__bound_calloc(size_t nmemb, size_t size)
 
     if (ptr) {
         memset (ptr, 0, size);
-        if (no_checking == 0) {
+        if (NO_CHECKING_GET() == 0) {
             WAIT_SEM ();
             INCR_COUNT(bound_calloc_count);
-            tree = splay_insert ((size_t) ptr, size, tree);
+            tree = splay_insert ((size_t) ptr, size ? size : size + 1, tree);
             if (tree && tree->start == (size_t) ptr)
                 tree->type = TCC_TYPE_CALLOC;
             POST_SEM ();
@@ -1277,7 +1599,7 @@ void *__bound_mmap (void *start, size_t size, int prot,
     dprintf(stderr, "%s, %s(): %p, 0x%lx\n",
             __FILE__, __FUNCTION__, start, (unsigned long)size);
     result = mmap (start, size, prot, flags, fd, offset);
-    if (result && no_checking == 0) {
+    if (result && NO_CHECKING_GET() == 0) {
         WAIT_SEM ();
         INCR_COUNT(bound_mmap_count);
         tree = splay_insert((size_t)result, size, tree);
@@ -1292,7 +1614,7 @@ int __bound_munmap (void *start, size_t size)
 
     dprintf(stderr, "%s, %s(): %p, 0x%lx\n",
             __FILE__, __FUNCTION__, start, (unsigned long)size);
-    if (start && no_checking == 0) {
+    if (start && NO_CHECKING_GET() == 0) {
         WAIT_SEM ();
         INCR_COUNT(bound_munmap_count);
         tree = splay_delete ((size_t) start, tree);
@@ -1308,8 +1630,7 @@ int __bound_munmap (void *start, size_t size)
 /* check that (p ... p + size - 1) lies inside 'p' region, if any */
 static void __bound_check(const void *p, size_t size, const char *function)
 {
-    if (no_checking == 0 && size != 0 &&
-        __bound_ptr_add((void *)p, size) == INVALID_POINTER) {
+    if (size != 0 && __bound_ptr_add((void *)p, size) == INVALID_POINTER) {
         bound_error("invalid pointer %p, size 0x%lx in %s",
                 p, (unsigned long)size, function);
     }
@@ -1322,7 +1643,7 @@ static int check_overlap (const void *p1, size_t n1,
     const void *p1e = (const void *) ((const char *) p1 + n1);
     const void *p2e = (const void *) ((const char *) p2 + n2);
 
-    if (no_checking == 0 && n1 != 0 && n2 !=0 &&
+    if (NO_CHECKING_GET() == 0 && n1 != 0 && n2 !=0 &&
         ((p1 <= p2 && p1e > p2) ||     /* p1----p2====p1e----p2e */
          (p2 <= p1 && p2e > p1))) {    /* p2----p1====p2e----p1e */
         bound_error("overlapping regions %p(0x%lx), %p(0x%lx) in %s",
@@ -1386,6 +1707,59 @@ void *__bound_memset(void *s, int c, size_t n)
     __bound_check(s, n, "memset");
     return memset(s, c, n);
 }
+
+#if defined(__arm__)
+void *__bound___aeabi_memcpy(void *dest, const void *src, size_t n)
+{
+    dprintf(stderr, "%s, %s(): %p, %p, 0x%lx\n",
+            __FILE__, __FUNCTION__, dest, src, (unsigned long)n);
+    INCR_COUNT(bound_mempcy_count);
+    __bound_check(dest, n, "memcpy dest");
+    __bound_check(src, n, "memcpy src");
+    if (check_overlap(dest, n, src, n, "memcpy"))
+        return dest;
+    return __aeabi_memcpy(dest, src, n);
+}
+
+void *__bound___aeabi_memmove(void *dest, const void *src, size_t n)
+{
+    dprintf(stderr, "%s, %s(): %p, %p, 0x%lx\n",
+            __FILE__, __FUNCTION__, dest, src, (unsigned long)n);
+    INCR_COUNT(bound_memmove_count);
+    __bound_check(dest, n, "memmove dest");
+    __bound_check(src, n, "memmove src");
+    return __aeabi_memmove(dest, src, n);
+}
+
+void *__bound___aeabi_memmove4(void *dest, const void *src, size_t n)
+{
+    dprintf(stderr, "%s, %s(): %p, %p, 0x%lx\n",
+            __FILE__, __FUNCTION__, dest, src, (unsigned long)n);
+    INCR_COUNT(bound_memmove_count);
+    __bound_check(dest, n, "memmove dest");
+    __bound_check(src, n, "memmove src");
+    return __aeabi_memmove4(dest, src, n);
+}
+
+void *__bound___aeabi_memmove8(void *dest, const void *src, size_t n)
+{
+    dprintf(stderr, "%s, %s(): %p, %p, 0x%lx\n",
+            __FILE__, __FUNCTION__, dest, src, (unsigned long)n);
+    INCR_COUNT(bound_memmove_count);
+    __bound_check(dest, n, "memmove dest");
+    __bound_check(src, n, "memmove src");
+    return __aeabi_memmove8(dest, src, n);
+}
+
+void *__bound___aeabi_memset(void *s, int c, size_t n)
+{
+    dprintf(stderr, "%s, %s(): %p, %d, 0x%lx\n",
+            __FILE__, __FUNCTION__, s, c, (unsigned long)n);
+    INCR_COUNT(bound_memset_count);
+    __bound_check(s, n, "memset");
+    return __aeabi_memset(s, c, n);
+}
+#endif
 
 int __bound_strlen(const char *s)
 {
@@ -1519,7 +1893,7 @@ char *__bound_strdup(const char *s)
     dprintf(stderr, "%s, %s(): %p, 0x%lx\n",
             __FILE__, __FUNCTION__, new, (unsigned long)(p -s));
     if (new) {
-        if (no_checking == 0 && no_strdup == 0) {
+        if (NO_CHECKING_GET() == 0 && no_strdup == 0) {
             WAIT_SEM ();
             tree = splay_insert((size_t)new, p - s, tree);
             if (tree && tree->start == (size_t) new)

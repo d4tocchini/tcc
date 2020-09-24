@@ -149,7 +149,7 @@ static int func_ret_sub;
 #if defined(CONFIG_TCC_BCHECK)
 static addr_t func_bound_offset;
 static unsigned long func_bound_ind;
-static int func_bound_add_epilog;
+ST_DATA int func_bound_add_epilog;
 #endif
 
 #ifdef TCC_TARGET_PE
@@ -441,6 +441,9 @@ void load(int r, SValue *sv)
             b = 0xbf0f;   /* movswl */
         } else if ((ft & VT_TYPE) == (VT_SHORT | VT_UNSIGNED)) {
             b = 0xb70f;   /* movzwl */
+        } else if ((ft & VT_TYPE) == (VT_VOID)) {
+            /* Can happen with zero size structs */
+            return;
         } else {
             assert(((ft & VT_BTYPE) == VT_INT)
                    || ((ft & VT_BTYPE) == VT_LLONG)
@@ -636,18 +639,6 @@ static void gcall_or_jmp(int is_jmp)
         greloca(cur_text_section, vtop->sym, ind + 1, R_X86_64_PLT32, (int)(vtop->c.i-4));
 #endif
         oad(0xe8 + is_jmp, 0); /* call/jmp im */
-#ifdef CONFIG_TCC_BCHECK
-        if (tcc_state->do_bounds_check &&
-            (vtop->sym->v == TOK_alloca ||
-             vtop->sym->v == TOK_setjmp ||
-             vtop->sym->v == TOK__setjmp
-#ifndef TCC_TARGET_PE
-             || vtop->sym->v == TOK_sigsetjmp
-             || vtop->sym->v == TOK___sigsetjmp
-#endif
-            ))
-            func_bound_add_epilog = 1;
-#endif
     } else {
         /* otherwise, indirect call */
         r = TREG_R11;
@@ -669,57 +660,6 @@ static void gen_bounds_call(int v)
 #else
     greloca(cur_text_section, sym, ind-4, R_X86_64_PLT32, -4);
 #endif
-}
-
-/* generate a bounded pointer addition */
-ST_FUNC void gen_bounded_ptr_add(void)
-{
-    vpush_global_sym(&func_old_type, TOK___bound_ptr_add);
-    vrott(3);
-    gfunc_call(2);
-    vpushi(0);
-    /* returned pointer is in rax */
-    vtop->r = TREG_RAX | VT_BOUNDED;
-    if (nocode_wanted)
-        return;
-    /* relocation offset of the bounding function call point */
-    vtop->c.i = (cur_text_section->reloc->data_offset - sizeof(ElfW(Rela)));
-}
-
-/* patch pointer addition in vtop so that pointer dereferencing is
-   also tested */
-ST_FUNC void gen_bounded_ptr_deref(void)
-{
-    addr_t func;
-    int size, align;
-    ElfW(Rela) *rel;
-    Sym *sym;
-
-    if (nocode_wanted)
-        return;
-
-    size = type_size(&vtop->type, &align);
-    switch(size) {
-    case  1: func = TOK___bound_ptr_indir1; break;
-    case  2: func = TOK___bound_ptr_indir2; break;
-    case  4: func = TOK___bound_ptr_indir4; break;
-    case  8: func = TOK___bound_ptr_indir8; break;
-    case 12: func = TOK___bound_ptr_indir12; break;
-    case 16: func = TOK___bound_ptr_indir16; break;
-    default:
-        /* may happen with struct member access */
-        return;
-        //tcc_error("unhandled size when dereferencing bounded pointer");
-        //func = 0;
-        //break;
-    }
-    sym = external_global_sym(func, &func_old_type);
-    if (!sym->c)
-        put_extern_sym(sym, NULL, 0, 0);
-    /* patch relocation */
-    /* XXX: find a better solution ? */
-    rel = (ElfW(Rela) *)(cur_text_section->reloc->data + vtop->c.i);
-    rel->r_info = ELF64_R_INFO(sym->c, ELF64_R_TYPE(rel->r_info));
 }
 
 #ifdef TCC_TARGET_PE
@@ -744,8 +684,9 @@ static void gen_bounds_epilog(void)
     addr_t saved_ind;
     addr_t *bounds_ptr;
     Sym *sym_data;
+    int offset_modified = func_bound_offset != lbounds_section->data_offset;
 
-    if (func_bound_offset == lbounds_section->data_offset && !func_bound_add_epilog)
+    if (!offset_modified && !func_bound_add_epilog)
         return;
 
     /* add end of table info */
@@ -756,7 +697,7 @@ static void gen_bounds_epilog(void)
                            func_bound_offset, lbounds_section->data_offset);
 
     /* generate bound local allocation */
-    if (func_bound_offset != lbounds_section->data_offset) {
+    if (offset_modified) {
         saved_ind = ind;
         ind = func_bound_ind;
         greloca(cur_text_section, sym_data, ind + 2, R_X86_64_64, 0);
@@ -1285,11 +1226,11 @@ void gfunc_call(int nb_args)
 {
     X86_64_Mode mode;
     CType type;
-    int size, align, r, args_size, stack_adjust, i, reg_count;
+    int size, align, r, args_size, stack_adjust, i, reg_count, k;
     int nb_reg_args = 0;
     int nb_sse_args = 0;
     int sse_reg, gen_reg;
-    char _onstack[nb_args ? nb_args : 1], *onstack = _onstack;
+    char *onstack = tcc_malloc((nb_args + 1) * sizeof (char));
 
 #ifdef CONFIG_TCC_BCHECK
     if (tcc_state->do_bounds_check)
@@ -1303,6 +1244,7 @@ void gfunc_call(int nb_args)
     stack_adjust = 0;
     for(i = nb_args - 1; i >= 0; i--) {
         mode = classify_x86_64_arg(&vtop[-i].type, NULL, &size, &align, &reg_count);
+        if (size == 0) continue;
         if (mode == x86_64_mode_sse && nb_sse_args + reg_count <= 8) {
             nb_sse_args += reg_count;
 	    onstack[i] = 0;
@@ -1335,23 +1277,25 @@ void gfunc_call(int nb_args)
     sse_reg = nb_sse_args;
     args_size = 0;
     stack_adjust &= 15;
-    for (i = 0; i < nb_args;) {
+    for (i = k = 0; i < nb_args;) {
 	mode = classify_x86_64_arg(&vtop[-i].type, NULL, &size, &align, &reg_count);
-	if (!onstack[i]) {
-	    ++i;
-	    continue;
-	}
-        /* Possibly adjust stack to align SSE boundary.  We're processing
-	   args from right to left while allocating happens left to right
-	   (stack grows down), so the adjustment needs to happen _after_
-	   an argument that requires it.  */
-        if (stack_adjust) {
-	    o(0x50); /* push %rax; aka sub $8,%rsp */
-            args_size += 8;
-	    stack_adjust = 0;
+	if (size) {
+            if (!onstack[i + k]) {
+	        ++i;
+	        continue;
+	    }
+            /* Possibly adjust stack to align SSE boundary.  We're processing
+	       args from right to left while allocating happens left to right
+	       (stack grows down), so the adjustment needs to happen _after_
+	       an argument that requires it.  */
+            if (stack_adjust) {
+	        o(0x50); /* push %rax; aka sub $8,%rsp */
+                args_size += 8;
+	        stack_adjust = 0;
+            }
+	    if (onstack[i + k] == 2)
+	        stack_adjust = 1;
         }
-	if (onstack[i] == 2)
-	  stack_adjust = 1;
 
 	vrotb(i+1);
 
@@ -1400,8 +1344,10 @@ void gfunc_call(int nb_args)
 
 	vpop();
 	--nb_args;
-	onstack++;
+	k++;
     }
+
+    tcc_free(onstack);
 
     /* XXX This should be superfluous.  */
     save_regs(0); /* save used temporary registers */
@@ -1414,6 +1360,7 @@ void gfunc_call(int nb_args)
     assert(sse_reg <= 8);
     for(i = 0; i < nb_args; i++) {
         mode = classify_x86_64_arg(&vtop->type, &type, &size, &align, &reg_count);
+        if (size == 0) continue;
         /* Alter stack entry type so that gv() knows how to treat it */
         vtop->type = type;
         if (mode == x86_64_mode_sse) {

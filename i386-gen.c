@@ -97,7 +97,7 @@ static int func_ret_sub;
 #ifdef CONFIG_TCC_BCHECK
 static addr_t func_bound_offset;
 static unsigned long func_bound_ind;
-static int func_bound_add_epilog;
+ST_DATA int func_bound_add_epilog;
 static void gen_bounds_prolog(void);
 static void gen_bounds_epilog(void);
 #endif
@@ -359,18 +359,6 @@ static void gcall_or_jmp(int is_jmp)
         /* constant and relocation case */
         greloc(cur_text_section, vtop->sym, ind + 1, R_386_PC32);
         oad(0xe8 + is_jmp, vtop->c.i - 4); /* call/jmp im */
-#ifdef CONFIG_TCC_BCHECK
-        if (tcc_state->do_bounds_check &&
-            (vtop->sym->v == TOK_alloca ||
-             vtop->sym->v == TOK_setjmp ||
-             vtop->sym->v == TOK__setjmp
-#ifndef TCC_TARGET_PE
-             || vtop->sym->v == TOK_sigsetjmp
-             || vtop->sym->v == TOK___sigsetjmp
-#endif
-            ))
-            func_bound_add_epilog = 1;
-#endif
     } else {
         /* otherwise, indirect call */
         r = gv(RC_INT);
@@ -429,6 +417,22 @@ ST_FUNC void gfunc_call(int nb_args)
             /* align to stack align size */
             size = (size + 3) & ~3;
             /* allocate the necessary size on stack */
+#ifdef TCC_TARGET_PE
+            if (size >= 0x4096) {
+                /* cannot call alloca with bound checking. Do stack probing. */
+                o(0x50);               // push %eax
+                oad(0xb8, size - 4);   // mov size-4,%eax
+                oad(0x3d, 4096);       // p1: cmp $4096,%eax
+                o(0x1476);             // jbe <p2>
+                oad(0x248485,-4096);   // test %eax,-4096(%esp)
+                oad(0xec81, 4096);     // sub $4096,%esp
+                oad(0x2d, 4096);       // sub $4096,%eax
+                o(0xe5eb);             // jmp <p1>
+                o(0xc429);             // p2: sub %eax,%esp
+                oad(0xc481, size - 4); // add size-4,%esp
+                o(0x58);               // pop %eax
+            }
+#endif
             oad(0xec81, size); /* sub $xxx, %esp */
             /* generate structure store */
             r = get_reg(RC_INT);
@@ -1023,56 +1027,6 @@ ST_FUNC void ggoto(void)
 
 /* bound check support functions */
 #ifdef CONFIG_TCC_BCHECK
-/* generate a bounded pointer addition */
-ST_FUNC void gen_bounded_ptr_add(void)
-{
-    vpush_global_sym(&func_old_type, TOK___bound_ptr_add);
-    vrott(3);
-    gfunc_call(2);
-    vpushi(0);
-    /* returned pointer is in eax */
-    vtop->r = TREG_EAX | VT_BOUNDED;
-    if (nocode_wanted)
-        return;
-    /* relocation offset of the bounding function call point */
-    vtop->c.i = (cur_text_section->reloc->data_offset - sizeof(Elf32_Rel));
-}
-
-/* patch pointer addition in vtop so that pointer dereferencing is
-   also tested */
-ST_FUNC void gen_bounded_ptr_deref(void)
-{
-    addr_t func;
-    int  size, align;
-    Elf32_Rel *rel;
-    Sym *sym;
-
-    if (nocode_wanted)
-        return;
-
-    size = type_size(&vtop->type, &align);
-    switch(size) {
-    case  1: func = TOK___bound_ptr_indir1; break;
-    case  2: func = TOK___bound_ptr_indir2; break;
-    case  4: func = TOK___bound_ptr_indir4; break;
-    case  8: func = TOK___bound_ptr_indir8; break;
-    case 12: func = TOK___bound_ptr_indir12; break;
-    case 16: func = TOK___bound_ptr_indir16; break;
-    default:
-        /* may happen with struct member access */
-        return;
-        //tcc_error("unhandled size when dereferencing bounded pointer");
-        //func = 0;
-        //break;
-    }
-    sym = external_global_sym(func, &func_old_type);
-    if (!sym->c)
-        put_extern_sym(sym, NULL, 0, 0);
-    /* patch relocation */
-    /* XXX: find a better solution ? */
-    rel = (Elf32_Rel *)(cur_text_section->reloc->data + vtop->c.i);
-    rel->r_info = ELF32_R_INFO(sym->c, ELF32_R_TYPE(rel->r_info));
-}
 
 static void gen_bounds_prolog(void)
 {
@@ -1089,8 +1043,9 @@ static void gen_bounds_epilog(void)
     addr_t saved_ind;
     addr_t *bounds_ptr;
     Sym *sym_data;
+    int offset_modified = func_bound_offset != lbounds_section->data_offset;
 
-    if (func_bound_offset == lbounds_section->data_offset && !func_bound_add_epilog)
+    if (!offset_modified && !func_bound_add_epilog)
         return;
 
     /* add end of table info */
@@ -1101,7 +1056,7 @@ static void gen_bounds_epilog(void)
                            func_bound_offset, lbounds_section->data_offset);
 
     /* generate bound local allocation */
-    if (func_bound_offset != lbounds_section->data_offset) {
+    if (offset_modified) {
         saved_ind = ind;
         ind = func_bound_ind;
         greloc(cur_text_section, sym_data, ind + 1, R_386_32);

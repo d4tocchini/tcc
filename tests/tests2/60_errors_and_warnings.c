@@ -328,5 +328,22 @@ int main()
 #elif defined test_stray_backslash
 #define x \a
 x
+
+#elif defined test_stray_backslash2
+int printf(const char*, ...);
+int main()
+{
+#define _S(x) #x
+#define S(x) _S(x)
+    printf("%sn\n", S(\\));
+}
+
 /******************************************************************/
+#elif defined test_var_array
+
+static struct var_len { int i; const char str[]; } var_array[] =
+{ { 1, "abcdefghijklmnopqrstuvwxyz" },
+  { 2, "longlonglonglonglong" },
+  { 3, "tst3" } };
+
 #endif
