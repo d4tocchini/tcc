@@ -1,4 +1,4 @@
-#!/usr/local/bin/tcc -run
+#!/usr/bin/env tccrun
 #include <tcclib.h>
 
 int main()
