@@ -354,5 +354,66 @@ struct c1 c1 = { 1, { 2, 3, 4 } };
 struct c2 { int c; struct c1 c1; };
 struct c2 c2 = { 1, { 2, { 3, 4, 5 }}};
 
+#elif defined test_var_array3
+/* similar to test_var_array2 but with string initializers */
+struct A { int a; char b[]; };
+struct A a = { 1, "1" };
+struct B { struct A a; };
+struct B b = { { 1, "1" } };
 /******************************************************************/
+#elif defined test_default_int_type
+n; // warn
+f(); // don't warn
+
+#elif defined test_invalid_global_stmtexpr
+n[sizeof({3;})]; // crashed in block() due to missing local scope
+
+#elif defined test_invalid_tokckill
+f(){"12"3;} // second const token killed the value of the first
+
+/******************************************************************/
+#elif defined test_duplicate_member
+struct S {
+  int a, a;
+};
+#elif defined test_duplicate_member_anon
+struct S1 {
+  int b;
+  struct {
+    int b;
+  } c;
+};
+struct S2 {
+  int d;
+  struct {
+    int d;
+  };
+};
+
+/******************************************************************/
+#elif defined test_conflicting_array_definition
+extern int array[2];
+int array[] = { 1, 2, 3 };
+
+#elif defined test_cast_from_void
+void v() {}
+int f() { return v(); }
+
+#elif defined test_switch_W1 || defined test_switch_W2 \
+   || defined test_switch_W3 || defined test_switch_W4
+#if defined test_switch_W1
+#pragma comment(option, "-Wall")
+#elif defined test_switch_W2
+#pragma comment(option, "-Wunsupported -Wno-implicit-function-declaration -Wstuff")
+#elif defined test_switch_W3
+#pragma comment(option, "-Wwrite-strings -Werror=discarded-qualifiers")
+#elif defined test_switch_W4
+#pragma comment(option, "-Wunsupported -Wno-error=implicit-function-declaration -Werror")
+#endif
+void func()
+{
+    char *ccp = "123";
+    fink();
+}
+__attribute__((stuff)) int fink() {return 0;}
 #endif

@@ -37,7 +37,7 @@ static const char help[] =
     "  -std=c11     Conform to the ISO 2011 C standard.\n"
     "  -Wwarning    set or reset (with 'no-' prefix) 'warning' (see tcc -hh)\n"
     "  -w           disable all warnings\n"
-    "  --version -v show version\n"
+    "  -v --version show version\n"
     "  -vv          show search paths or loaded files\n"
     "  -h -hh       show this, show more help\n"
     "  -bench       show compilation statistics\n"
@@ -70,7 +70,8 @@ static const char help[] =
     "  -nostdinc    do not use standard system include paths\n"
     "  -nostdlib    do not link with standard crt and libraries\n"
     "  -Bdir        set tcc's private include/library dir\n"
-    "  -MD          generate dependency file for make\n"
+    "  -M[M]D       generate make dependency file [ignore system files]\n"
+    "  -M[M]        as above but no other output\n"
     "  -MF file     specify dependency file name\n"
 #if defined(TCC_TARGET_I386) || defined(TCC_TARGET_X86_64)
     "  -m32/64      defer to i386/x86_64 cross compiler\n"
@@ -97,13 +98,14 @@ static const char help2[] =
     "  -print-search-dirs            print search paths\n"
     "  -dt                           with -run/-E: auto-define 'test_...' macros\n"
     "Ignored options:\n"
-    "  --param  -pedantic  -pipe  -s  -traditional\n"
-    "-W... warnings:\n"
+    "  -arch -C --param -pedantic -pipe -s -traditional\n"
+    "-W[no-]... warnings:\n"
     "  all                           turn on some (*) warnings\n"
-    "  error                         stop after first warning\n"
-    "  unsupported                   warn about ignored options, pragmas, etc.\n"
+    "  error[=warning]               stop after warning (any or specified)\n"
     "  write-strings                 strings are const\n"
+    "  unsupported                   warn about ignored options, pragmas, etc.\n"
     "  implicit-function-declaration warn for missing prototype (*)\n"
+    "  discarded-qualifiers          warn when const is dropped (*)\n"
     "-f[no-]... flags:\n"
     "  unsigned-char                 default char is unsigned\n"
     "  signed-char                   default char is signed\n"
@@ -111,6 +113,7 @@ static const char help2[] =
     "  leading-underscore            decorate extern symbols\n"
     "  ms-extensions                 allow anonymous struct in struct\n"
     "  dollars-in-identifiers        allow '$' in C symbols\n"
+    "  test-coverage                 create code coverage code\n"
     "-m... target specific options:\n"
     "  ms-bitfields                  use MSVC bitfield layout\n"
 #ifdef TCC_TARGET_ARM
@@ -148,7 +151,11 @@ static const char help2[] =
     ;
 
 static const char version[] =
-    "tcc version "TCC_VERSION" ("
+    "tcc version "TCC_VERSION
+#ifdef TCC_GITHASH
+    " "TCC_GITHASH
+#endif
+    " ("
 #ifdef TCC_TARGET_I386
         "i386"
 #elif defined TCC_TARGET_X86_64
@@ -157,20 +164,27 @@ static const char version[] =
         "C67"
 #elif defined TCC_TARGET_ARM
         "ARM"
+# ifdef TCC_ARM_EABI
+        " eabi"
+#  ifdef TCC_ARM_HARDFLOAT
+        "hf"
+#  endif
+# endif
 #elif defined TCC_TARGET_ARM64
         "AArch64"
 #elif defined TCC_TARGET_RISCV64
         "riscv64"
 #endif
-#ifdef TCC_ARM_HARDFLOAT
-        " Hard Float"
-#endif
 #ifdef TCC_TARGET_PE
         " Windows"
 #elif defined(TCC_TARGET_MACHO)
         " Darwin"
-#elif defined(__FreeBSD__) || defined(__FreeBSD_kernel__)
+#elif TARGETOS_FreeBSD || TARGETOS_FreeBSD_kernel
         " FreeBSD"
+#elif TARGETOS_OpenBSD
+        " OpenBSD"
+#elif TARGETOS_NetBSD
+        " NetBSD"
 #else
         " Linux"
 #endif
@@ -236,7 +250,7 @@ static char *default_outputfile(TCCState *s, const char *first_file)
         strcpy(ext, ".exe");
     else
 #endif
-    if (s->output_type == TCC_OUTPUT_OBJ && !s->option_r && *ext)
+    if ((s->just_deps || s->output_type == TCC_OUTPUT_OBJ) && !s->option_r && *ext)
         strcpy(ext, ".o");
     else
         strcpy(buf, "a.out");
@@ -258,7 +272,7 @@ int main(int argc0, char **argv0)
 {
     TCCState *s, *s1;
     int ret, opt, n = 0, t = 0, done;
-    unsigned start_time = 0;
+    unsigned start_time = 0, end_time = 0;
     const char *first_file;
     int argc; char **argv;
     FILE *ppfp = stdout;
@@ -300,7 +314,7 @@ redo:
         }
 
         if (s->nb_files == 0)
-            tcc_error("no input files\n");
+            tcc_error("no input files");
 
         if (s->output_type == TCC_OUTPUT_PREPROCESS) {
             if (s->outfile && 0!=strcmp("-",s->outfile)) {
@@ -354,6 +368,9 @@ redo:
         done = ret || ++n >= s->nb_files;
     } while (!done && (s->output_type != TCC_OUTPUT_OBJ || s->option_r));
 
+    if (s->do_bench)
+        end_time = getclock_ms();
+
     if (s->run_test) {
         t = 0;
     } else if (s->output_type == TCC_OUTPUT_PREPROCESS) {
@@ -366,20 +383,22 @@ redo:
         } else {
             if (!s->outfile)
                 s->outfile = default_outputfile(s, first_file);
-            if (tcc_output_file(s, s->outfile))
+            if (!s->just_deps && tcc_output_file(s, s->outfile))
                 ret = 1;
             else if (s->gen_deps)
                 gen_makedeps(s, s->outfile, s->deps_outfile);
         }
     }
 
-    if (s->do_bench && done && !(t | ret))
-        tcc_print_stats(s, getclock_ms() - start_time);
+    if (done && 0 == t && 0 == ret && s->do_bench)
+        tcc_print_stats(s, end_time - start_time);
+
     tcc_delete(s);
     if (!done)
         goto redo; /* compile more files with -c */
     if (t)
         goto redo; /* run more tests with -dt -run */
+
     if (ppfp && ppfp != stdout)
         fclose(ppfp);
     return ret;
