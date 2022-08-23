@@ -48,12 +48,17 @@ gcc_minor=0
 cc_name="gcc"
 ar_set=
 darwin=
-cpu=
 cpuver=
+dwarf=
+
+# use CC from environment when set
+test -n "$CC" && cc="$CC"
 
 # OS specific
-cpu_sys=`uname -m`
+cpu=`uname -m`
+cpu_sys="$cpu"
 targetos=`uname`
+test "$(uname -o)" = "Android" && targetos=Android
 
 case $targetos in
   Darwin)
@@ -71,6 +76,20 @@ case $targetos in
   DragonFly|OpenBSD|FreeBSD|NetBSD)
     confvars="$confvars BSD ldl=no"
     ;;
+  Android)
+    confvars="$confvars Android pie new-dtags"
+    if test -n "$TERMUX_VERSION"; then
+      prefix="$PREFIX" # "/data/data/com.termux/files/usr"
+      sysroot="$PREFIX"
+      test "$cpu" = "aarch64" -o "$cpu" = "x86_64" && S="64" || S=""
+      tcc_sysincludepaths="{B}/include:{R}/include/\\\"CONFIG_TRIPLET\\\":{R}/include"
+      tcc_libpaths="{B}:{R}/lib:/system/lib${S}"
+      tcc_crtprefix="{R}/lib"
+      tcc_elfinterp="/system/bin/linker${S}"
+      use_triplet="yes"
+      tcc_switches="-Wl,-rpath=$sysroot/lib,-section-alignment=0x1000"
+    fi
+    ;;
   *)
     ;;
 esac
@@ -87,35 +106,35 @@ fi
 for opt do
   eval opt=\"$opt\"
   case "$opt" in
-  --prefix=*) prefix=`echo $opt | cut -d '=' -f 2`
+  --prefix=*) prefix=`echo $opt | cut -d '=' -f 2-`
   ;;
-  --exec-prefix=*) execprefix=`echo $opt | cut -d '=' -f 2`
+  --exec-prefix=*) execprefix=`echo $opt | cut -d '=' -f 2-`
   ;;
-  --tccdir=*) tccdir=`echo $opt | cut -d '=' -f 2`
+  --tccdir=*) tccdir=`echo $opt | cut -d '=' -f 2-`
   ;;
-  --bindir=*) bindir=`echo $opt | cut -d '=' -f 2`
+  --bindir=*) bindir=`echo $opt | cut -d '=' -f 2-`
   ;;
-  --libdir=*) libdir=`echo $opt | cut -d '=' -f 2`
+  --libdir=*) libdir=`echo $opt | cut -d '=' -f 2-`
   ;;
-  --includedir=*) includedir=`echo $opt | cut -d '=' -f 2`
+  --includedir=*) includedir=`echo $opt | cut -d '=' -f 2-`
   ;;
-  --sharedir=*) sharedir=`echo $opt | cut -d '=' -f 2`
+  --sharedir=*) sharedir=`echo $opt | cut -d '=' -f 2-`
   ;;
-  --mandir=*) mandir=`echo $opt | cut -d '=' -f 2`
+  --mandir=*) mandir=`echo $opt | cut -d '=' -f 2-`
   ;;
-  --infodir=*) infodir=`echo $opt | cut -d '=' -f 2`
+  --infodir=*) infodir=`echo $opt | cut -d '=' -f 2-`
   ;;
-  --docdir=*) docdir=`echo $opt | cut -d '=' -f 2`
+  --docdir=*) docdir=`echo $opt | cut -d '=' -f 2-`
   ;;
-  --sysroot=*) sysroot=`echo $opt | cut -d '=' -f 2`
+  --sysroot=*) sysroot=`echo $opt | cut -d '=' -f 2-`
   ;;
-  --source-path=*) source_path=`echo $opt | cut -d '=' -f 2`
+  --source-path=*) source_path=`echo $opt | cut -d '=' -f 2-`
   ;;
-  --cross-prefix=*) cross_prefix=`echo $opt | cut -d '=' -f 2`
+  --cross-prefix=*) cross_prefix=`echo $opt | cut -d '=' -f 2-`
   ;;
-  --cc=*) cc=`echo $opt | cut -d '=' -f 2`
+  --cc=*) cc=`echo $opt | cut -d '=' -f 2-`
   ;;
-  --ar=*) ar=`echo $opt | cut -d '=' -f 2` ; ar_set="yes"
+  --ar=*) ar=`echo $opt | cut -d '=' -f 2-` ; ar_set="yes"
   ;;
   --extra-cflags=*) CFLAGS="${opt#--extra-cflags=}"
   ;;
@@ -123,17 +142,19 @@ for opt do
   ;;
   --extra-libs=*) extralibs="${opt#--extra-libs=}"
   ;;
-  --sysincludepaths=*) tcc_sysincludepaths=`echo $opt | cut -d '=' -f 2`
+  --sysincludepaths=*) tcc_sysincludepaths=`echo $opt | cut -d '=' -f 2-`
   ;;
-  --libpaths=*) tcc_libpaths=`echo $opt | cut -d '=' -f 2`
+  --libpaths=*) tcc_libpaths=`echo $opt | cut -d '=' -f 2-`
   ;;
-  --crtprefix=*) tcc_crtprefix=`echo $opt | cut -d '=' -f 2`
+  --crtprefix=*) tcc_crtprefix=`echo $opt | cut -d '=' -f 2-`
   ;;
-  --elfinterp=*) tcc_elfinterp=`echo $opt | cut -d '=' -f 2`
+  --elfinterp=*) tcc_elfinterp=`echo $opt | cut -d '=' -f 2-`
   ;;
-  --triplet=*) triplet=`echo $opt | cut -d '=' -f 2`
+  --triplet=*) triplet=`echo $opt | cut -d '=' -f 2-`
   ;;
-  --cpu=*) cpu=`echo $opt | cut -d '=' -f 2`
+  --cpu=*) cpu=`echo $opt | cut -d '=' -f 2-`
+  ;;
+  --dwarf=*) dwarf=`echo $opt | cut -d '=' -f 2-`
   ;;
   --enable-cross) confvars="$confvars cross"
   ;;
@@ -148,6 +169,8 @@ for opt do
   --with-libgcc) confvars="$confvars libgcc"
   ;;
   --with-selinux) confvars="$confvars selinux"
+  ;;
+  --tcc-switches=*) tcc_switches=`echo $opt | cut -d '=' -f 2-`
   ;;
   --config-mingw32*) mingw32=$(echo "$opt=yes" | cut -d '=' -f 2)
   ;;
@@ -171,9 +194,6 @@ if test "$darwin" = "yes" -a "$cpu" = "x86_64" -a "$cpu_sys" = "arm64"; then
     CFLAGS="$CFLAGS -arch $cpu"
     LDFLAGS="$LDFLAGS -arch $cpu"
 fi
-
-# checking for cpu
-test -z "$cpu" && cpu="$cpu_sys"
 
 case "$cpu" in
   x86|i386|i486|i586|i686|i86pc|BePC|i686-AT386)
@@ -321,12 +341,14 @@ Advanced options (experts only):
   --crtprefix=...          specify locations of crt?.o, colon separated
   --elfinterp=...          specify elf interpreter
   --triplet=...            specify system library/include directory triplet
+  --tcc-switches=...       specify implicit switches passed to tcc
 
   --config-uClibc,-musl    enable system specific configurations
   --config-mingw32         build on windows using msys, busybox, etc.
   --config-backtrace=no    disable stack backtraces (with -run or -bt)
   --config-bcheck=no       disable bounds checker (-b)
   --config-predefs=no      do not compile tccdefs.h, instead just include
+  --dwarf=x                Use dwarf debug info instead of stabs (x=2..5)
 EOF
 exit 1
 fi
@@ -344,8 +366,8 @@ if test -z "$cross_prefix" ; then
   fi
   if test "$mingw32" = "no" ; then
 
-      if test -z "$triplet"; then
-        if test -n "$_triplet" -a -f "/usr/lib/$_triplet/crti.o" ; then
+      if test -z "$triplet" -a -n "$_triplet"; then
+        if test -f "/usr/lib/$_triplet/crti.o" -o -n "$use_triplet" ; then
           triplet="$_triplet"
         fi
       fi
@@ -367,8 +389,7 @@ if test -z "$cross_prefix" ; then
 	   confvars="$confvars arm_eabihf arm_vfp"
 	elif test "${_triplet%eabi}" != "$_triplet" ; then
 	   confvars="$confvars arm_eabi arm_vfp"
-	fi
-	if grep -s -q "^Features.* \(vfp\|iwmmxt\) " /proc/cpuinfo ; then
+	elif grep -s -q "^Features.* \(vfp\|iwmmxt\) " /proc/cpuinfo ; then
 	   confvars="$confvars arm_vfp"
 	fi
       fi
@@ -403,6 +424,7 @@ if test "$cc_name" != "tcc"; then
   OPT1="-Wdeclaration-after-statement -fno-strict-aliasing"
   # we want -Wno- but gcc does not always reject unknown -Wno- options
   OPT2="-Wpointer-sign -Wsign-compare -Wunused-result -Wformat-truncation"
+  OPT2="$OPT2 -Wstringop-truncation"
   if test "$cc_name" = "clang"; then
     OPT1="$OPT1 -fheinous-gnu-extensions"
     OPT2="$OPT2 -Wstring-plus-int"
@@ -484,11 +506,13 @@ echo "/* Automatically generated by configure - do not modify */" > $TMPH
 
 print_inc CONFIG_SYSROOT "$sysroot"
 test "$tccdir_auto" = "yes" || print_inc CONFIG_TCCDIR "$tccdir"
+print_inc DWARF_VERSION "$dwarf" num
 print_mak CONFIG_USR_INCLUDE "$tcc_usrinclude"
 print_mak CONFIG_TCC_SYSINCLUDEPATHS "$tcc_sysincludepaths"
 print_mak CONFIG_TCC_LIBPATHS "$tcc_libpaths"
 print_mak CONFIG_TCC_CRTPREFIX "$tcc_crtprefix"
 print_mak CONFIG_TCC_ELFINTERP "$tcc_elfinterp"
+print_mak CONFIG_TCC_SWITCHES "$tcc_switches"
 print_mak CONFIG_LDDIR "$tcc_lddir"
 print_mak CONFIG_TRIPLET "$triplet"
 print_mak TCC_CPU_VERSION "$cpuver" num

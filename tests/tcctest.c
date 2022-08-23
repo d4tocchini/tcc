@@ -21,14 +21,19 @@
 typedef __SIZE_TYPE__ uintptr_t;
 #endif
 
-#if defined(_WIN32) || \
-    (defined(__arm__) && \
-     (defined(__FreeBSD__) || defined(__OpenBSD__) || defined(__NetBSD__)))
+#if defined(_WIN32) \
+    || (defined(__arm__) \
+        && (defined(__FreeBSD__) \
+         || defined(__OpenBSD__) \
+         || defined(__NetBSD__) \
+         || defined __ANDROID__))
 #define LONG_LONG_FORMAT "%lld"
 #define ULONG_LONG_FORMAT "%llu"
+#define XLONG_LONG_FORMAT "%llx"
 #else
 #define LONG_LONG_FORMAT "%Ld"
 #define ULONG_LONG_FORMAT "%Lu"
+#define XLONG_LONG_FORMAT "%Lx"
 #endif
 
 // MinGW has 80-bit rather than 64-bit long double which isn't compatible with TCC or MSVC
@@ -77,6 +82,9 @@ typedef __SIZE_TYPE__ uintptr_t;
 #include INC(42test)
 #include incname
 #include stringify(funnyname)
+
+int puts(const char *s);
+void *alloca(size_t size);
 
 int fib(int n);
 void num(int n);
@@ -549,11 +557,17 @@ void goto_test()
 {
     int i;
     static void *label_table[3] = { &&label1, &&label2, &&label3 };
+    struct {
+        int bla;
+        /* This needs to parse as typedef, not as label.  */
+        typedef_and_label : 32;
+    } y = {1};
 
     printf("\ngoto:\n");
     i = 0;
+    /* This is a normal decl.  */
+    typedef_and_label x;
     /* This needs to parse as label, not as start of decl.  */
- typedef_and_label x;
  typedef_and_label:
  s_loop:
     if (i >= 10) 
@@ -1404,6 +1418,13 @@ void optimize_out_test(void)
       undefined_function();
   }
 
+  if (0) {
+      switch (defined_function()) {
+          case 0: undefined_function(); break;
+          default: undefined_function(); break;
+      }
+  }
+
   /* Leave the "if(1)return; printf()" in this order and last in the function */
   if (1)
     return;
@@ -1516,8 +1537,6 @@ struct structa1 {
     char f2;
 };
 
-struct structa1 ssta1;
-
 void struct_assign_test1(struct structa1 s1, int t, float f)
 {
     printf("%d %d %d %f\n", s1.f1, s1.f2, t, f);
@@ -1535,22 +1554,12 @@ void struct_assign_test(void)
     struct S {
       struct structa1 lsta1, lsta2;
       int i;
-    } s, *ps;
+    } s = {{1,2}, {3,4}}, *ps;
     
     ps = &s;
     ps->i = 4;
-#if 0
-    s.lsta1.f1 = 1;
-    s.lsta1.f2 = 2;
-    printf("%d %d\n", s.lsta1.f1, s.lsta1.f2);
-    s.lsta2 = s.lsta1;
-    printf("%d %d\n", s.lsta2.f1, s.lsta2.f2);
-#else
-    s.lsta2.f1 = 1;
-    s.lsta2.f2 = 2;
-#endif
+
     struct_assign_test1(ps->lsta2, 3, 4.5);
-    
     printf("before call: %d %d\n", s.lsta2.f1, s.lsta2.f2);
     ps->lsta2 = struct_assign_test2(ps->lsta2, ps->i);
     printf("after call: %d %d\n", ps->lsta2.f1, ps->lsta2.f2);
@@ -1562,6 +1571,9 @@ void struct_assign_test(void)
         { struct_assign_test }
     };
     printf("%d\n", struct_assign_test == t[0].elem);
+
+    s.lsta1 = s.lsta2 = struct_assign_test2(s.lsta1, 1);
+    printf("%d %d\n", s.lsta1.f1, s.lsta1.f2);
 }
 
 /* casts to short/char */
@@ -2271,7 +2283,7 @@ double ftab1[3] = { 1.2, 3.4, -5.6 };
 
 void float_test(void)
 {
-#if !defined(__arm__) || defined(__ARM_PCS_VFP)
+#if !defined(__arm__) || defined(__ARM_PCS_VFP) || defined __ANDROID__
     volatile float fa, fb;
     volatile double da, db;
     int a;
@@ -2537,7 +2549,7 @@ void longlong_test(void)
     b = 0x12345678;
     a = -1;
     c = a + b;
-    printf("%Lx\n", c);
+    printf(XLONG_LONG_FORMAT"\n", c);
 #endif
 
     /* long long reg spill test */
@@ -2915,7 +2927,6 @@ typedef int constant_negative_array_size_as_compile_time_assertion_idiom[(1 ? 2 
 
 void c99_vla_test_1(int size1, int size2)
 {
-#if defined __i386__ || defined __x86_64__
     int size = size1 * size2;
     int tab1[size][2], tab2[10][2];
     void *tab1_ptr, *tab2_ptr, *bad_ptr;
@@ -2961,12 +2972,86 @@ void c99_vla_test_1(int size1, int size2)
         printf("PASSED PASSED PASSED PASSED PASSED PASSED PASSED PASSED ");
     }
     printf("\n");
-#endif
+}
+
+void c99_vla_test_2(int d, int h, int w)
+{
+    int x, y, z;
+    int (*arr)[h][w] = malloc(sizeof(int) * d*h*w);
+    int c = 1;
+
+    printf("Test C99 VLA 6 (pointer)\n");
+
+    for (z=0; z<d; z++) {
+        for (y=0; y<h; y++) {
+            for (x=0; x<w; x++) {
+                arr[z][y][x] = c++;
+            }
+        }
+    }
+    for (z=0; z<d; z++) {
+        for (y=0; y<h; y++) {
+            for (x=0; x<w; x++) {
+                printf(" %2d", arr[z][y][x]);
+            }
+            puts("");
+        }
+        puts("");
+    }
+    printf(" sizes : %d %d %d\n"
+           " pdiff : %d %d\n"
+           " tests : %d %d\n",
+        sizeof (*arr), sizeof (*arr)[0], sizeof (*arr)[0][0],
+        arr + 2 - arr, *arr + 3 - *arr,
+        0 == sizeof (*arr + 1) - sizeof arr,
+        0 == sizeof sizeof *arr - sizeof arr
+        );
+    free (arr);
+}
+
+void c99_vla_test_3a (int arr[2][3][4])
+{
+    printf ("%d\n", arr[1][2][3]);
+}
+
+void c99_vla_test_3b(int s, int arr[s][3][4])
+{
+    printf ("%d\n", arr[1][2][3]);
+}
+
+void c99_vla_test_3c(int s, int arr[2][s][4])
+{
+    printf ("%d\n", arr[1][2][3]);
+}
+
+void c99_vla_test_3d(int s, int arr[2][3][s])
+{
+    printf ("%d\n", arr[1][2][3]);
+}
+
+void c99_vla_test_3e(int s, int arr[][3][s])
+{
+    printf ("%d\n", arr[1][2][3]);
+}
+
+void c99_vla_test_3(void)
+{
+    int a[2][3][4];
+
+    memset (a, 0, sizeof(a));
+    a[1][2][3] = 2;
+    c99_vla_test_3a(a);
+    c99_vla_test_3b(2, a);
+    c99_vla_test_3c(3, a);
+    c99_vla_test_3d(4, a);
+    c99_vla_test_3e(4, a);
 }
 
 void c99_vla_test(void)
 {
     c99_vla_test_1(5, 2);
+    c99_vla_test_2(3, 4, 5);
+    c99_vla_test_3();
 }
 
 
@@ -3209,7 +3294,7 @@ return dest;
 
 static inline void * memcpy1(void * to, const void * from, size_t n)
 {
-long d0, d1, d2;
+size_t d0, d1, d2;
 __asm__ __volatile__(
 	"rep ; movsl\n\t"
 	"testb $2,%b4\n\t"
@@ -3220,14 +3305,14 @@ __asm__ __volatile__(
 	"movsb\n"
 	"2:"
 	: "=&c" (d0), "=&D" (d1), "=&S" (d2)
-	:"0" (n/4), "q" (n),"1" ((long) to),"2" ((long) from)
+	:"0" (n/4), "q" (n),"1" ((size_t) to),"2" ((size_t) from)
 	: "memory");
 return (to);
 }
 
 static inline void * memcpy2(void * to, const void * from, size_t n)
 {
-long d0, d1, d2;
+size_t d0, d1, d2;
 __asm__ __volatile__(
 	"rep movsl\n\t"  /* one-line rep prefix + string op */
 	"testb $2,%b4\n\t"
@@ -3238,7 +3323,7 @@ __asm__ __volatile__(
 	"movsb\n"
 	"2:"
 	: "=&c" (d0), "=&D" (d1), "=&S" (d2)
-	:"0" (n/4), "q" (n),"1" ((long) to),"2" ((long) from)
+	:"0" (n/4), "q" (n),"1" ((size_t) to),"2" ((size_t) from)
 	: "memory");
 return (to);
 }
@@ -3336,7 +3421,7 @@ void other_constraints_test(void)
 {
     unsigned long ret;
     int var;
-#ifndef _WIN64
+#if !defined(_WIN64) && CC_NAME != CC_clang
     __asm__ volatile ("mov %P1,%0" : "=r" (ret) : "p" (&var));
     printf ("oc1: %d\n", ret == (unsigned long)&var);
 #endif
@@ -4178,8 +4263,9 @@ void func_arg_test(void)
 #define CORRECT_CR_HANDLING
 
 /* deprecated and no longer supported in gcc 3.3 */
+/* no longer supported by default in TinyCC */
 #ifdef __TINYC__
-# define ACCEPT_CR_IN_STRINGS
+/* # define ACCEPT_LF_IN_STRINGS */
 #endif
 
 /* keep this as the last test because GCC messes up line-numbers
@@ -4203,7 +4289,7 @@ ntf("aaa=%d\n", 3);
 \
 ntf("min=%d\n", 4);
 
-#ifdef ACCEPT_CR_IN_STRINGS
+#ifdef ACCEPT_LF_IN_STRINGS
     printf("len1=%d\n", strlen("
 "));
 #ifdef CORRECT_CR_HANDLING
@@ -4215,7 +4301,7 @@ ntf("min=%d\n", 4);
 "));
 #else
     printf("len1=1\nlen1=1 str[0]=10\nlen1=3\n");
-#endif /* ACCEPT_CR_IN_STRINGS */
+#endif /* ACCEPT_LF_IN_STRINGS */
 
 #ifdef __LINE__
     printf("__LINE__ defined\n");
@@ -4229,6 +4315,12 @@ ntf("min=%d\n", 4);
 #line 2222 "test"
     printf("__LINE__=%d __FILE__=%s\n", __LINE__, __FILE__);
 #endif
+
+    printf("\\
+"12\\
+063\\
+n 456\"\n");
+
 }
 
 #define RUN(test) puts("---- " #test " ----"), test(), puts("")

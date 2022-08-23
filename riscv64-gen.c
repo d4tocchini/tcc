@@ -183,7 +183,8 @@ static int load_symofs(int r, SValue *sv, int forstore)
             doload = 1;
         }
         label.type.t = VT_VOID | VT_STATIC;
-        put_extern_sym(&label, cur_text_section, ind, 0);
+	if (!nocode_wanted)
+            put_extern_sym(&label, cur_text_section, ind, 0);
         rr = is_ireg(r) ? ireg(r) : 5;
         o(0x17 | (rr << 7));   // auipc RR, 0 %pcrel_hi(sym)+addend
         greloca(cur_text_section, &label, ind,
@@ -470,7 +471,7 @@ static void gen_bounds_epilog(void)
     *bounds_ptr = 0;
 
     sym_data = get_sym_ref(&char_pointer_type, lbounds_section,
-                           func_bound_offset, lbounds_section->data_offset);
+                           func_bound_offset, PTR_SIZE);
 
     label.type.t = VT_VOID | VT_STATIC;
     /* generate bound local allocation */

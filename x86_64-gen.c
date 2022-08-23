@@ -35,6 +35,8 @@
 #define RC_RAX     0x0004
 #define RC_RCX     0x0008
 #define RC_RDX     0x0010
+#define RC_RSI     0x0020
+#define RC_RDI     0x0040
 #define RC_ST0     0x0080 /* only for long double */
 #define RC_R8      0x0100
 #define RC_R9      0x0200
@@ -105,6 +107,10 @@ enum {
 /* define if return values need to be extended explicitely
    at caller side (for interfacing with non-TCC compilers) */
 #define PROMOTE_RET
+
+#define TCC_TARGET_NATIVE_STRUCT_COPY
+ST_FUNC void gen_struct_copy(int size);
+
 /******************************************************/
 #else /* ! TARGET_DEFS_ONLY */
 /******************************************************/
@@ -124,8 +130,8 @@ ST_DATA const int reg_classes[NB_REGS] = {
     0,
     0,
     0,
-    0,
-    0,
+    RC_RSI,
+    RC_RDI,
     RC_R8,
     RC_R9,
     RC_R10,
@@ -701,7 +707,7 @@ static void gen_bounds_epilog(void)
     *bounds_ptr = 0;
 
     sym_data = get_sym_ref(&char_pointer_type, lbounds_section, 
-                           func_bound_offset, lbounds_section->data_offset);
+                           func_bound_offset, PTR_SIZE);
 
     /* generate bound local allocation */
     if (offset_modified) {
@@ -715,10 +721,18 @@ static void gen_bounds_epilog(void)
 
     /* generate bound check local freeing */
     o(0x5250); /* save returned value, if any */
+    o(0x20ec8348); /* sub $32,%rsp */
+    o(0x290f);     /* movaps %xmm0,0x10(%rsp) */
+    o(0x102444);
+    o(0x240c290f); /* movaps %xmm1,(%rsp) */
     greloca(cur_text_section, sym_data, ind + 3, R_X86_64_PC32, -4);
     o(0x0d8d48 + ((TREG_FASTCALL_1 == TREG_RDI) * 0x300000)); /* lea xxx(%rip), %rcx/rdi */
     gen_le32 (0);
     gen_bounds_call(TOK___bound_local_delete);
+    o(0x280f);     /* movaps 0x10(%rsp),%xmm0 */
+    o(0x102444);
+    o(0x240c280f); /* movaps (%rsp),%xmm1 */
+    o(0x20c48348); /* add $32,%rsp */
     o(0x585a); /* restore returned value, if any */
 }
 #endif
@@ -1317,7 +1331,14 @@ void gfunc_call(int nb_args)
 		o(0xe0 + REG_VALUE(r));
 		vset(&vtop->type, r | VT_LVAL, 0);
 		vswap();
+		/* keep stack aligned for (__bound_)memmove call */
+		o(0x10ec8348); /* sub $16,%rsp */
+		o(0xf0e48348); /* and $-16,%rsp */
+		orex(0,r,0,0x50 + REG_VALUE(r)); /* push r (last %rsp) */
+		o(0x08ec8348); /* sub $8,%rsp */
 		vstore();
+		o(0x08c48348); /* add $8,%rsp */
+		o(0x5c);       /* pop %rsp */
 		break;
 
 	    case VT_LDOUBLE:
@@ -2213,7 +2234,7 @@ ST_FUNC void gen_increment_tcov (SValue *sv)
 }
 
 /* computed goto support */
-void ggoto(void)
+ST_FUNC void ggoto(void)
 {
     gcall_or_jmp(1);
     vtop--;
@@ -2267,6 +2288,38 @@ ST_FUNC void gen_vla_alloc(CType *type, int align) {
     }
 }
 
+/*
+ * Assmuing the top part of the stack looks like below,
+ *  src dest src
+ */
+ST_FUNC void gen_struct_copy(int size)
+{
+    int n = size / PTR_SIZE;
+#ifdef TCC_TARGET_PE
+    o(0x5756); /* push rsi, rdi */
+#endif
+    gv2(RC_RDI, RC_RSI);
+    if (n <= 4) {
+        while (n)
+            o(0xa548), --n;
+    } else {
+        vpushi(n);
+        gv(RC_RCX);
+        o(0xa548f3);
+        vpop();
+    }
+    if (size & 0x04)
+        o(0xa5);
+    if (size & 0x02)
+        o(0xa566);
+    if (size & 0x01)
+        o(0xa4);
+#ifdef TCC_TARGET_PE
+    o(0x5e5f); /* pop rdi, rsi */
+#endif
+    vpop();
+    vpop();
+}
 
 /* end of x86-64 code generator */
 /*************************************************************/

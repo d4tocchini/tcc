@@ -161,7 +161,7 @@ static pthread_spinlock_t bounds_spin;
 #define HAVE_TLS_FUNC          (1)
 #define HAVE_TLS_VAR           (0)
 #endif
-#ifdef TCC_MUSL
+#if defined TCC_MUSL || defined __ANDROID__
 # undef HAVE_CTYPE
 #endif
 #endif
@@ -221,20 +221,23 @@ typedef struct alloca_list_struct {
 } alloca_list_type;
 
 #if defined(_WIN32)
-#define BOUND_TID_TYPE   DWORD
-#define BOUND_GET_TID    GetCurrentThreadId()
+#define BOUND_TID_TYPE		DWORD
+#define BOUND_GET_TID(id)	id = GetCurrentThreadId()
 #elif defined(__OpenBSD__)
-#define BOUND_TID_TYPE   pid_t
-#define BOUND_GET_TID    syscall (SYS_getthrid)
-#elif defined(__FreeBSD__) || defined(__NetBSD__)
-#define BOUND_TID_TYPE   pid_t
-#define BOUND_GET_TID    0
-#elif defined(__i386__) || defined(__x86_64__) || defined(__arm__) || defined(__aarch64__) || defined(__riscv)
-#define BOUND_TID_TYPE   pid_t
-#define BOUND_GET_TID    syscall (SYS_gettid)
+#define BOUND_TID_TYPE		pid_t
+#define BOUND_GET_TID(id)	id = syscall (SYS_getthrid)
+#elif defined(__FreeBSD__)
+#define BOUND_TID_TYPE		pid_t
+#define BOUND_GET_TID(id)	syscall (SYS_thr_self, &id)
+#elif  defined(__NetBSD__)
+#define BOUND_TID_TYPE		pid_t
+#define BOUND_GET_TID(id)	id = syscall (SYS__lwp_self)
+#elif defined(__linux__)
+#define BOUND_TID_TYPE		pid_t
+#define BOUND_GET_TID(id)	id = syscall (SYS_gettid)
 #else
-#define BOUND_TID_TYPE   int
-#define BOUND_GET_TID    0
+#define BOUND_TID_TYPE		int
+#define BOUND_GET_TID(id)	id = 0
 #endif
 
 typedef struct jmp_list_struct {
@@ -254,6 +257,8 @@ void splay_printtree(Tree * t, int d);
 
 /* external interface */
 void __bounds_checking (int no_check);
+void __bound_checking_lock (void);
+void __bound_checking_unlock (void);
 void __bound_never_fatal (int no_check);
 DLL_EXPORT void * __bound_ptr_add(void *p, size_t offset);
 DLL_EXPORT void * __bound_ptr_indir1(void *p, size_t offset);
@@ -267,6 +272,7 @@ DLL_EXPORT void FASTCALL __bound_local_delete(void *p1);
 void __bound_init(size_t *, int);
 void __bound_main_arg(int argc, char **argv, char **envp);
 void __bound_exit(void);
+void __bound_exit_dll(size_t *);
 #if !defined(_WIN32)
 void *__bound_mmap (void *start, size_t size, int prot, int flags, int fd,
                     off_t offset);
@@ -439,7 +445,11 @@ int tcc_backtrace(const char *fmt, ...);
 
 /* print a bound error message */
 #define bound_warning(...) \
-    tcc_backtrace("^bcheck.c^BCHECK: " __VA_ARGS__)
+    do {                                                 \
+        WAIT_SEM ();                                     \
+        tcc_backtrace("^bcheck.c^BCHECK: " __VA_ARGS__); \
+        POST_SEM ();                                     \
+    } while (0)
 
 #define bound_error(...)            \
     do {                            \
@@ -490,6 +500,16 @@ void __bounds_checking (int no_check)
 #else
     fetch_and_add (&no_checking, no_check);
 #endif
+}
+
+void __bound_checking_lock(void)
+{
+    WAIT_SEM ();
+}
+
+void __bound_checking_unlock(void)
+{
+    POST_SEM ();
 }
 
 /* enable/disable checking. This can be used in signal handlers. */
@@ -805,7 +825,7 @@ void __bound_setjmp(jmp_buf env)
             GET_CALLER_FP (fp);
             jl->fp = fp;
             jl->end_fp = (size_t)__builtin_frame_address(0);
-            jl->tid = BOUND_GET_TID;
+            BOUND_GET_TID(jl->tid);
         }
         POST_SEM ();
     }
@@ -819,7 +839,7 @@ static void __bound_long_jump(jmp_buf env, int val, int sig, const char *func)
 
     if (NO_CHECKING_GET() == 0) {
         e = (void *)env;
-        tid = BOUND_GET_TID;
+        BOUND_GET_TID(tid);
         dprintf(stderr, "%s, %s(): %p\n", __FILE__, func, e);
         WAIT_SEM();
         INCR_COUNT(bound_longjmp_count);
@@ -1154,7 +1174,8 @@ void __attribute__((destructor)) __bound_exit(void)
 
     if (inited) {
 #if !defined(_WIN32) && !defined(__APPLE__) && !defined TCC_MUSL && \
-    !defined(__OpenBSD__) && !defined(__FreeBSD__) && !defined(__NetBSD__)
+    !defined(__OpenBSD__) && !defined(__FreeBSD__) && !defined(__NetBSD__) && \
+    !defined(__ANDROID__)
         if (print_heap) {
             extern void __libc_freeres (void);
             __libc_freeres ();
@@ -1249,6 +1270,27 @@ void __attribute__((destructor)) __bound_exit(void)
             fprintf (stderr, "bound_splay_delete       %llu\n", bound_splay_delete);
 #endif
         }
+    }
+}
+
+void __bound_exit_dll(size_t *p)
+{
+    dprintf(stderr, "%s, %s()\n", __FILE__, __FUNCTION__);
+
+    if (p) {
+        WAIT_SEM ();
+	while (p[0] != 0) {
+	    tree = splay_delete(p[0], tree);
+#if BOUND_DEBUG
+            if (print_calls) {
+                dprintf(stderr, "%s, %s(): remove static var %p 0x%lx\n",
+                        __FILE__, __FUNCTION__,
+                        (void *) p[0], (unsigned long) p[1]);
+            }
+#endif
+	    p += 2;
+	}
+        POST_SEM ();
     }
 }
 
@@ -1448,7 +1490,7 @@ void *__bound_malloc(size_t size, const void *caller)
     dprintf(stderr, "%s, %s(): %p, 0x%lx\n",
             __FILE__, __FUNCTION__, ptr, (unsigned long)size);
     
-    if (NO_CHECKING_GET() == 0) {
+    if (inited && NO_CHECKING_GET() == 0) {
         WAIT_SEM ();
         INCR_COUNT(bound_malloc_count);
 
@@ -1520,7 +1562,7 @@ void __bound_free(void *ptr, const void *caller)
 
     dprintf(stderr, "%s, %s(): %p\n", __FILE__, __FUNCTION__, ptr);
 
-    if (NO_CHECKING_GET() == 0) {
+    if (inited && NO_CHECKING_GET() == 0) {
         WAIT_SEM ();
         INCR_COUNT(bound_free_count);
         tree = splay (addr, tree);

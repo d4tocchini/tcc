@@ -88,7 +88,10 @@ NATIVE_DEFINES_$(CONFIG_arm_vfp) += -DTCC_ARM_VFP
 NATIVE_DEFINES_$(CONFIG_arm64) += -DTCC_TARGET_ARM64
 NATIVE_DEFINES_$(CONFIG_riscv64) += -DTCC_TARGET_RISCV64
 NATIVE_DEFINES_$(CONFIG_BSD) += -DTARGETOS_$(TARGETOS)
+NATIVE_DEFINES_$(CONFIG_Android) += -DTARGETOS_ANDROID
 NATIVE_DEFINES_$(CONFIG_pie) += -DCONFIG_TCC_PIE
+NATIVE_DEFINES_$(CONFIG_pic) += -DCONFIG_TCC_PIC
+NATIVE_DEFINES_$(CONFIG_new-dtags) += -DCONFIG_NEW_DTAGS
 NATIVE_DEFINES_no_$(CONFIG_bcheck) += -DCONFIG_TCC_BCHECK=0
 NATIVE_DEFINES_no_$(CONFIG_backtrace) += -DCONFIG_TCC_BACKTRACE=0
 NATIVE_DEFINES += $(NATIVE_DEFINES_yes) $(NATIVE_DEFINES_no_no)
@@ -170,10 +173,10 @@ DEFINES += $(DEF-$(or $(findstring win,$T),unx))
 
 ifneq ($(X),)
 ifeq ($(CONFIG_WIN32),yes)
-DEF-win += -DTCC_LIBTCC1="\"$(X)libtcc1.a\""
-DEF-unx += -DTCC_LIBTCC1="\"lib/$(X)libtcc1.a\""
+DEF-win += -DCONFIG_TCC_CROSSPREFIX="\"$X\""
+DEF-unx += -DCONFIG_TCC_CROSSPREFIX="\"lib/$X\""
 else
-DEF-all += -DTCC_LIBTCC1="\"$(X)libtcc1.a\""
+DEF-all += -DCONFIG_TCC_CROSSPREFIX="\"$X\""
 DEF-win += -DCONFIG_TCCDIR="\"$(tccdir)/win32\""
 endif
 endif
@@ -181,7 +184,7 @@ endif
 # include custom configuration (see make help)
 -include config-extra.mak
 
-CORE_FILES = tcc.c tcctools.c libtcc.c tccpp.c tccgen.c tccelf.c tccasm.c tccrun.c
+CORE_FILES = tcc.c tcctools.c libtcc.c tccpp.c tccgen.c tccdbg.c tccelf.c tccasm.c tccrun.c
 CORE_FILES += tcc.h config.h libtcc.h tcctok.h
 i386_FILES = $(CORE_FILES) i386-gen.c i386-link.c i386-asm.c i386-asm.h i386-tok.h
 i386-win32_FILES = $(i386_FILES) tccpe.c
@@ -222,7 +225,7 @@ endif
 
 GITHASH := $(shell git rev-parse >/dev/null 2>&1 && git rev-parse --short HEAD || echo no)
 ifneq ($(GITHASH),no)
-DEF_GITHASH := -DTCC_GITHASH="\"$(GITHASH)$(shell git diff --quiet || echo '-mod')\""
+DEF_GITHASH := -DTCC_GITHASH="\"$(shell git rev-parse --abbrev-ref HEAD):$(GITHASH)$(shell git diff --quiet || echo '-mod')\""
 endif
 
 ifeq ($(CONFIG_debug),yes)
@@ -273,7 +276,7 @@ libtcc.a: $(LIBTCC_OBJ)
 
 # dynamic libtcc library
 libtcc.so: $(LIBTCC_OBJ)
-	$S$(CC) -shared -Wl,-soname,$@ -o $@ $^ $(LDFLAGS)
+	$S$(CC) -shared -Wl,-soname,$@ -o $@ $^ $(LIBS) $(LDFLAGS)
 
 libtcc.so: CFLAGS+=-fPIC
 libtcc.so: LDFLAGS+=-fPIC
@@ -323,6 +326,8 @@ tcc.1 : tcc-doc.pod
 		--release="$(VERSION)" $< >$@ && rm -f $<)
 %.pod : %.texi
 	$(call run-if,perl,$(TOPSRC)/texi2pod.pl $< $@)
+
+doc : $(TCCDOCS)
 
 # --------------------------------------------------------------------------
 # install
@@ -431,15 +436,16 @@ testspp.%:
 	@$(MAKE) -C tests/pp $@
 
 clean:
-	@rm -f tcc$(EXESUF) tcc_p$(EXESUF) *-tcc$(EXESUF) tcc.pod tags ETAGS
+	@rm -f tcc$(EXESUF) tcc_p$(EXESUF) *-tcc$(EXESUF) tags ETAGS *.pod
 	@rm -f *.o *.a *.so* *.out *.log lib*.def *.exe *.dll a.out *.dylib *_.h
 	@$(MAKE) -s -C lib $@
 	@$(MAKE) -s -C tests $@
 
 distclean: clean
-	@rm -fv config.h config.mak config.texi tcc.1 tcc-doc.info tcc-doc.html
+	@rm -fv config.h config.mak config.texi
+	@rm -fv $(TCCDOCS)
 
-.PHONY: all clean test tar tags ETAGS distclean install uninstall FORCE
+.PHONY: all clean test tar tags ETAGS doc distclean install uninstall FORCE
 
 help:
 	@echo "make"

@@ -543,7 +543,7 @@ static void load_value(SValue *sv, int r)
 {
     o(0xE59F0000|(intr(r)<<12)); /* ldr r, [pc] */
     o(0xEA000000); /* b $+4 */
-#ifndef CONFIG_TCC_PIE
+#ifndef CONFIG_TCC_PIC
     if(sv->r & VT_SYM)
         greloc(cur_text_section, sv->sym, ind, R_ARM_ABS32);
     o(sv->c.i);
@@ -866,7 +866,7 @@ static void gen_bounds_epilog(void)
     *bounds_ptr = 0;
 
     sym_data = get_sym_ref(&char_pointer_type, lbounds_section,
-                           func_bound_offset, lbounds_section->data_offset);
+                           func_bound_offset, PTR_SIZE);
 
     /* generate bound local allocation */
     if (offset_modified) {
@@ -883,14 +883,14 @@ static void gen_bounds_epilog(void)
 
     /* generate bound check local freeing */
     o(0xe92d0003);  /* push {r0,r1} */
-    o(0xed2d0b02);  /* vpush {d0} */
+    o(0xed2d0b04);  /* vpush {d0,d1} */
     o(0xe59f0000);  /* ldr r0, [pc] */
     o(0xea000000);  /* b $+4 */
     greloc(cur_text_section, sym_data, ind, R_ARM_REL32);
     o(-12);  /* lbounds_section->data_offset */
     o(0xe080000f);  /* add r0,r0,pc */
     gen_bounds_call(TOK___bound_local_delete);
-    o(0xecbd0b02); /* vpop {d0} */
+    o(0xecbd0b04); /* vpop {d0,d1} */
     o(0xe8bd0003); /* pop {r0,r1} */
 }
 #endif

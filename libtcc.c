@@ -21,6 +21,7 @@
 #if !defined ONE_SOURCE || ONE_SOURCE
 #include "tccpp.c"
 #include "tccgen.c"
+#include "tccdbg.c"
 #include "tccasm.c"
 #include "tccelf.c"
 #include "tccrun.c"
@@ -495,6 +496,8 @@ static void tcc_split_path(TCCState *s, void *p_ary, int *p_nb_ary, const char *
                 c = p[1], p += 2;
                 if (c == 'B')
                     cstr_cat(&str, s->tcc_lib_path, -1);
+                if (c == 'R')
+                    cstr_cat(&str, CONFIG_SYSROOT, -1);
                 if (c == 'f' && file) {
                     /* substitute current file's dir */
                     const char *f = file->true_filename;
@@ -809,7 +812,9 @@ LIBTCCAPI TCCState *tcc_new(void)
 #ifdef TCC_TARGET_ARM
     s->float_abi = ARM_FLOAT_ABI;
 #endif
-
+#ifdef CONFIG_NEW_DTAGS
+    s->enable_new_dtags = 1;
+#endif
     s->ppfp = stdout;
     /* might be used in error() before preprocess_start() */
     s->include_stack_ptr = s->include_stack;
@@ -836,8 +841,10 @@ LIBTCCAPI void tcc_delete(TCCState *s1)
     tcc_free(s1->tcc_lib_path);
     tcc_free(s1->soname);
     tcc_free(s1->rpath);
+    tcc_free(s1->elf_entryname);
     tcc_free(s1->init_symbol);
     tcc_free(s1->fini_symbol);
+    tcc_free(s1->mapfile);
     tcc_free(s1->outfile);
     tcc_free(s1->deps_outfile);
     dynarray_reset(&s1->files, &s1->nb_files);
@@ -850,7 +857,7 @@ LIBTCCAPI void tcc_delete(TCCState *s1)
     /* free runtime memory */
     tcc_run_free(s1);
 #endif
-
+    tcc_free(s1->dState);
     tcc_free(s1);
 #ifdef MEM_DEBUG
     if (0 == --nb_states)
@@ -860,6 +867,10 @@ LIBTCCAPI void tcc_delete(TCCState *s1)
 
 LIBTCCAPI int tcc_set_output_type(TCCState *s, int output_type)
 {
+#ifdef CONFIG_TCC_PIE
+    if (output_type == TCC_OUTPUT_EXE)
+        output_type |= TCC_OUTPUT_DYN;
+#endif
     s->output_type = output_type;
 
     if (!s->nostdinc) {
@@ -867,6 +878,10 @@ LIBTCCAPI int tcc_set_output_type(TCCState *s, int output_type)
         /* -isystem paths have already been handled */
         tcc_add_sysinclude_path(s, CONFIG_TCC_SYSINCLUDEPATHS);
     }
+
+    if (output_type == TCC_OUTPUT_PREPROCESS)
+        return 0;
+
 #ifdef CONFIG_TCC_BCHECK
     if (s->do_bounds_check) {
         /* if bound checking, then add corresponding sections */
@@ -875,7 +890,7 @@ LIBTCCAPI int tcc_set_output_type(TCCState *s, int output_type)
 #endif
     if (s->do_debug) {
         /* add debug sections */
-        tccelf_stab_new(s);
+        tcc_debug_new(s);
     }
     if (output_type == TCC_OUTPUT_OBJ) {
         /* always elf for objects */
@@ -903,9 +918,9 @@ LIBTCCAPI int tcc_set_output_type(TCCState *s, int output_type)
 #else
     /* paths for crt objects */
     tcc_split_path(s, &s->crt_paths, &s->nb_crt_paths, CONFIG_TCC_CRTPREFIX);
+
     /* add libc crt1/crti objects */
-    if ((output_type == TCC_OUTPUT_EXE || output_type == TCC_OUTPUT_DLL) &&
-        !s->nostdlib) {
+    if (output_type != TCC_OUTPUT_MEMORY && !s->nostdlib) {
 #if TARGETOS_OpenBSD
         if (output_type != TCC_OUTPUT_DLL)
 	    tcc_add_crt(s, "crt0.o");
@@ -919,7 +934,7 @@ LIBTCCAPI int tcc_set_output_type(TCCState *s, int output_type)
         tcc_add_crt(s, "crti.o");
         if (s->static_link)
             tcc_add_crt(s, "crtbeginT.o");
-        else if (output_type == TCC_OUTPUT_DLL)
+        else if (output_type & TCC_OUTPUT_DYN)
             tcc_add_crt(s, "crtbeginS.o");
         else
             tcc_add_crt(s, "crtbegin.o");
@@ -929,10 +944,15 @@ LIBTCCAPI int tcc_set_output_type(TCCState *s, int output_type)
         tcc_add_crt(s, "crti.o");
         if (s->static_link)
             tcc_add_crt(s, "crtbeginT.o");
-        else if (output_type == TCC_OUTPUT_DLL)
+        else if (output_type & TCC_OUTPUT_DYN)
             tcc_add_crt(s, "crtbeginS.o");
         else
             tcc_add_crt(s, "crtbegin.o");
+#elif defined TARGETOS_ANDROID
+        if (output_type != TCC_OUTPUT_DLL)
+            tcc_add_crt(s, "crtbegin_dynamic.o");
+        else
+            tcc_add_crt(s, "crtbegin_so.o");
 #else
         if (output_type != TCC_OUTPUT_DLL)
             tcc_add_crt(s, "crt1.o");
@@ -955,11 +975,29 @@ LIBTCCAPI int tcc_add_sysinclude_path(TCCState *s, const char *pathname)
     return 0;
 }
 
-ST_FUNC DLLReference *tcc_add_dllref(TCCState *s1, const char *dllname)
+/* add/update a 'DLLReference', Just find if level == -1  */
+ST_FUNC DLLReference *tcc_add_dllref(TCCState *s1, const char *dllname, int level)
 {
-    DLLReference *ref = tcc_mallocz(sizeof(DLLReference) + strlen(dllname));
+    DLLReference *ref = NULL;
+    int i;
+    for (i = 0; i < s1->nb_loaded_dlls; i++)
+        if (0 == strcmp(s1->loaded_dlls[i]->name, dllname)) {
+            ref = s1->loaded_dlls[i];
+            break;
+        }
+    if (level == -1)
+        return ref;
+    if (ref) {
+        if (level < ref->level)
+            ref->level = level;
+        ref->found = 1;
+        return ref;
+    }
+    ref = tcc_mallocz(sizeof(DLLReference) + strlen(dllname));
     strcpy(ref->name, dllname);
     dynarray_add(&s1->loaded_dlls, &s1->nb_loaded_dlls, ref);
+    ref->level = level;
+    ref->index = s1->nb_loaded_dlls;
     return ref;
 }
 
@@ -1040,7 +1078,7 @@ ST_FUNC int tcc_add_file_internal(TCCState *s1, const char *filename, int flags)
                     soname = macho_tbd_soname(filename);
                 dl = dlopen(soname, RTLD_GLOBAL | RTLD_LAZY);
                 if (dl)
-                    tcc_add_dllref(s1, soname)->handle = dl, ret = 0;
+                    tcc_add_dllref(s1, soname, 0)->handle = dl, ret = 0;
 	        if (filename != soname)
 		    tcc_free((void *)soname);
 #endif
@@ -1068,7 +1106,7 @@ ST_FUNC int tcc_add_file_internal(TCCState *s1, const char *filename, int flags)
 #ifdef TCC_IS_NATIVE
                 void* dl = dlopen(filename, RTLD_GLOBAL | RTLD_LAZY);
                 if (dl)
-                    tcc_add_dllref(s1, filename)->handle = dl, ret = 0;
+                    tcc_add_dllref(s1, filename, 0)->handle = dl, ret = 0;
 #endif
             } else
                 ret = tcc_load_dll(s1, fd, filename, (flags & AFF_REFERENCED_DLL) != 0);
@@ -1147,15 +1185,24 @@ static int tcc_add_library_internal(TCCState *s, const char *fmt,
     return -1;
 }
 
-#ifndef TCC_TARGET_MACHO
 /* find and load a dll. Return non zero if not found */
-/* XXX: add '-rpath' option support ? */
 ST_FUNC int tcc_add_dll(TCCState *s, const char *filename, int flags)
 {
     return tcc_add_library_internal(s, "%s/%s", filename, flags,
         s->library_paths, s->nb_library_paths);
 }
+
+/* find [cross-]libtcc1.a and tcc helper objects in library path */
+ST_FUNC void tcc_add_support(TCCState *s1, const char *filename)
+{
+#ifdef CONFIG_TCC_CROSSPREFIX
+    char buf[100];
+    snprintf(buf, sizeof buf, "%s%s", CONFIG_TCC_CROSSPREFIX, filename);
+    filename = buf;
 #endif
+    if (tcc_add_dll(s1, filename, 0) < 0)
+        tcc_error_noabort("%s not found", filename);
+}
 
 #if !defined TCC_TARGET_PE && !defined TCC_TARGET_MACHO
 ST_FUNC int tcc_add_crt(TCCState *s1, const char *filename)
@@ -1336,6 +1383,9 @@ static int tcc_set_linker(TCCState *s, const char *option)
             s->symbolic = 1;
         } else if (link_option(option, "nostdlib", &p)) {
             s->nostdlib = 1;
+        } else if (link_option(option, "e=", &p)
+               ||  link_option(option, "entry=", &p)) {
+            copy_linker_arg(&s->elf_entryname, p, 0);
         } else if (link_option(option, "fini=", &p)) {
             copy_linker_arg(&s->fini_symbol, p, 0);
             ignoring = 1;
@@ -1345,6 +1395,9 @@ static int tcc_set_linker(TCCState *s, const char *option)
             s->has_text_addr = 1;
         } else if (link_option(option, "init=", &p)) {
             copy_linker_arg(&s->init_symbol, p, 0);
+            ignoring = 1;
+        } else if (link_option(option, "Map=", &p)) {
+            copy_linker_arg(&s->mapfile, p, 0);
             ignoring = 1;
         } else if (link_option(option, "oformat=", &p)) {
 #if defined(TCC_TARGET_PE)
@@ -1801,6 +1854,7 @@ reparse:
             s->rt_num_callers = atoi(optarg);
             s->do_backtrace = 1;
             s->do_debug = 1;
+	    s->dwarf = DWARF_VERSION;
             break;
 #endif
 #ifdef CONFIG_TCC_BCHECK
@@ -1808,10 +1862,14 @@ reparse:
             s->do_bounds_check = 1;
             s->do_backtrace = 1;
             s->do_debug = 1;
+	    s->dwarf = DWARF_VERSION;
             break;
 #endif
         case TCC_OPTION_g:
             s->do_debug = 1;
+	    s->dwarf = DWARF_VERSION;
+	    if (strstart("dwarf-", &optarg))
+                s->dwarf = atoi(optarg);
             break;
         case TCC_OPTION_c:
             x = TCC_OUTPUT_OBJ;
